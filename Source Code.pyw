@@ -457,56 +457,112 @@ class Vic3Logic:
 
         found_any = False
 
+        # Optimization: Prioritize file named "TAG - ..." or "TAG.txt"
+        target_files = []
+        all_files_map = {} # path -> filename
+
         for root, _, files in os.walk(hist_dir):
             for file in files:
                 if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
+                fpath = os.path.join(root, file)
+                all_files_map[fpath] = file
 
-                current_idx = 0
-                while True:
-                    c_start, c_end = self.get_block_range_safe(content, f"c:{clean_tag}", current_idx)
-                    if c_start is None: break
-                    found_any = True
+                # Check for "TAG - *" or "TAG.txt" (case insensitive)
+                # This ensures we look for the specific file first
+                fname_lower = file.lower()
+                tag_lower = clean_tag.lower()
 
-                    sb, _ = self.find_block_content(content, c_start)
-                    if sb is not None:
-                        block_inner = content[sb+1 : c_end-1]
+                if fname_lower.startswith(f"{tag_lower} -") or fname_lower == f"{tag_lower}.txt":
+                    target_files.append(fpath)
 
-                        data["tech_tier"].extend(re.findall(r"effect_starting_technology_tier_\d+_tech\s*=\s*yes", block_inner))
-                        data["politics"].extend(re.findall(r"effect_starting_politics_[a-z_]+\s*=\s*yes", block_inner))
-                        data["techs_researched"].extend(re.findall(r"add_technology_researched\s*=\s*[a-zA-Z0-9_]+", block_inner))
-                        data["laws"].extend([l.strip() for l in re.findall(r"^\s*(activate_law\s*=\s*.*)$", block_inner, re.MULTILINE)])
+        # If specific files found, scan ONLY those. Otherwise scan ALL.
+        files_to_scan = target_files if target_files else list(all_files_map.keys())
 
-                        inst_pattern = re.compile(r"(set_institution_[a-zA-Z0-9_]+)\s*=\s*", re.MULTILINE)
-                        cursor = 0
-                        while True:
-                            match = inst_pattern.search(block_inner, cursor)
-                            if not match: break
+        for path in files_to_scan:
+            try:
+                with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
+            except:
+                with open(path, 'r', encoding='utf-8') as f: content = f.read()
 
-                            next_char_idx = match.end()
-                            while next_char_idx < len(block_inner) and block_inner[next_char_idx].isspace():
-                                next_char_idx += 1
+            current_idx = 0
+            while True:
+                c_start, c_end = self.get_block_range_safe(content, f"c:{clean_tag}", current_idx)
+                if c_start is None: break
+                found_any = True
 
-                            if next_char_idx < len(block_inner) and block_inner[next_char_idx] == '{':
-                                b_start, b_end = self.find_block_content(block_inner, next_char_idx)
-                                if b_start is not None:
-                                    data["institutions"].append(block_inner[match.start():b_end].strip())
-                                    cursor = b_end
-                                else:
-                                    cursor = match.end()
+                sb, _ = self.find_block_content(content, c_start)
+                if sb is not None:
+                    block_inner = content[sb+1 : c_end-1]
+
+                    data["tech_tier"].extend(re.findall(r"effect_starting_technology_tier_\d+_tech\s*=\s*yes", block_inner))
+                    data["politics"].extend(re.findall(r"effect_starting_politics_[a-z_]+\s*=\s*yes", block_inner))
+                    data["techs_researched"].extend(re.findall(r"add_technology_researched\s*=\s*[a-zA-Z0-9_]+", block_inner))
+                    data["laws"].extend([l.strip() for l in re.findall(r"^\s*(activate_law\s*=\s*.*)$", block_inner, re.MULTILINE)])
+
+                    inst_pattern = re.compile(r"(set_institution_[a-zA-Z0-9_]+)\s*=\s*", re.MULTILINE)
+                    cursor = 0
+                    while True:
+                        match = inst_pattern.search(block_inner, cursor)
+                        if not match: break
+
+                        next_char_idx = match.end()
+                        while next_char_idx < len(block_inner) and block_inner[next_char_idx].isspace():
+                            next_char_idx += 1
+
+                        if next_char_idx < len(block_inner) and block_inner[next_char_idx] == '{':
+                            b_start, b_end = self.find_block_content(block_inner, next_char_idx)
+                            if b_start is not None:
+                                data["institutions"].append(block_inner[match.start():b_end].strip())
+                                cursor = b_end
                             else:
-                                line_end = block_inner.find('\n', match.end())
-                                if line_end == -1: line_end = len(block_inner)
-                                data["institutions"].append(block_inner[match.start():line_end].strip())
-                                cursor = line_end
-                    current_idx = c_end
+                                cursor = match.end()
+                        else:
+                            line_end = block_inner.find('\n', match.end())
+                            if line_end == -1: line_end = len(block_inner)
+                            data["institutions"].append(block_inner[match.start():line_end].strip())
+                            cursor = line_end
+                current_idx = c_end
 
         if not found_any: return None
         return data
+
+    def ensure_country_history_exists(self, new_tag, donor_tag, target_states=None):
+        hist_dir = os.path.join(self.mod_path, "common/history/countries")
+        clean_new = new_tag.replace("c:", "").strip().upper()
+
+        # Check if file exists
+        if os.path.exists(hist_dir):
+            for root, _, files in os.walk(hist_dir):
+                for file in files:
+                    if not file.endswith(".txt"): continue
+                    try:
+                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
+                    except:
+                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
+
+                    if re.search(r"(?:^|\s)c:" + re.escape(clean_new) + r"(\?=|:|=)", content):
+                        return # Exists
+
+        self.log(f"[INFO] History file for {clean_new} missing. Creating using default template...", 'info')
+
+        # Name
+        name, _ = self.load_country_localization(clean_new)
+        if not name: name = clean_new.lower()
+        filename = f"{clean_new.lower()} - {name.lower()}.txt"
+
+        os.makedirs(hist_dir, exist_ok=True)
+        filepath = os.path.join(hist_dir, filename)
+
+        content = f"""COUNTRIES = {{
+\tc:{clean_new} ?= {{
+\t\teffect_starting_technology_tier_2_tech = yes
+\t\t
+\t\teffect_starting_politics_conservative = yes
+\t}}
+}}"""
+
+        with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(content)
+        self.log(f"[SUCCESS] Created history file: {filename}", 'success')
 
     def get_nearest_vic3_color(self, rgb):
         colors = {
@@ -565,69 +621,20 @@ class Vic3Logic:
         # History
         hist_dir = os.path.join(self.mod_path, "common/history/countries")
         os.makedirs(hist_dir, exist_ok=True)
-        hist_file = os.path.join(hist_dir, f"{tag} - {name}.txt")
+        hist_file = os.path.join(hist_dir, f"{tag.lower()} - {name.lower()}.txt")
 
         # Extended Data Extraction
         ext_data = self.get_extended_history_data(old_tag)
         old_tag_details = self.load_country_history_details(old_tag)
         gov_type = old_tag_details.get("gov_type", "monarchy")
 
-        laws_block = ""
-        tech_tier_str = ""
-        techs_res_str = ""
-        politics_str = ""
-        inst_str = ""
-
-        if ext_data:
-            if ext_data["laws"]:
-                laws_block = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["laws"])))
-            if ext_data["tech_tier"]:
-                tech_tier_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["tech_tier"])))
-            if ext_data["techs_researched"]:
-                techs_res_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["techs_researched"])))
-            if ext_data["politics"]:
-                politics_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["politics"])))
-            if ext_data["institutions"]:
-                inst_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["institutions"])))
-
-        if not laws_block:
-            laws_block = """
-    activate_law = law_type:law_monarchy
-    activate_law = law_type:law_autocracy
-    activate_law = law_type:law_peasant_levies
-    activate_law = law_type:law_land_tax
-""" if gov_type == "monarchy" else """
-    activate_law = law_type:law_presidential_republic
-    activate_law = law_type:law_census_voting
-    activate_law = law_type:law_national_militia
-    activate_law = law_type:law_per_capita_tax
-    activate_law = law_type:law_appointed_bureaucrats
-"""
-
-        if not tech_tier_str:
-             tech_tier_str = "effect_starting_technology_tier_1_tech = yes"
-
-        ig_ruler = "ig_landowners" if gov_type == "monarchy" else "ig_intelligentsia"
-
         hist_content = f"""COUNTRIES = {{
-    c:{tag} ?= {{
-        {tech_tier_str}
-        set_tax_level = medium
-        {laws_block}
-        {politics_str}
-        {techs_res_str}
-        {inst_str}
-
-        create_character = {{
-            first_name = "Alexander"
-            last_name = "Modman"
-            birth_date = 1800.1.1
-            ruler = yes
-            interest_group = {ig_ruler}
-        }}
-    }}
-}}
-"""
+\tc:{tag} ?= {{
+\t\teffect_starting_technology_tier_2_tech = yes
+\t\t
+\t\teffect_starting_politics_conservative = yes
+\t}}
+}}"""
         with open(hist_file, 'w', encoding='utf-8-sig') as f: f.write(hist_content)
 
         # Population History
@@ -1633,6 +1640,17 @@ class Vic3Logic:
                     break
 
                 abs_match_start = cursor + match.start()
+
+                # Check if commented out
+                substring = inner_body[cursor:abs_match_start]
+                last_newline = substring.rfind('\n')
+                line_prefix = substring[last_newline+1:] if last_newline != -1 else substring
+                if '#' in line_prefix:
+                    # It's commented out, skip this match but preserve text
+                    new_inner_parts.append(inner_body[cursor:abs_match_start + match.end()])
+                    cursor = abs_match_start + match.end()
+                    continue
+
                 new_inner_parts.append(inner_body[cursor:abs_match_start])
 
                 brace_idx = abs_match_start + match.group().find('{')
@@ -1679,6 +1697,16 @@ class Vic3Logic:
                             break
 
                         u_abs_start = f_cursor + u_match.start()
+
+                        # Check if commented out
+                        substring = f_body[f_cursor:u_abs_start]
+                        last_newline = substring.rfind('\n')
+                        line_prefix = substring[last_newline+1:] if last_newline != -1 else substring
+                        if '#' in line_prefix:
+                            new_f_body_parts.append(f_body[f_cursor:u_abs_start + u_match.end()])
+                            f_cursor = u_abs_start + u_match.end()
+                            continue
+
                         new_f_body_parts.append(f_body[f_cursor:u_abs_start])
 
                         u_brace_idx = u_abs_start + u_match.group().find('{')
@@ -2223,6 +2251,19 @@ class Vic3Logic:
             owners_found.discard(f"c:{clean_new}")
             owners_found.discard(clean_new)
             target_owners = list(owners_found)
+
+        # NEW: Ensure country history exists if missing
+        if target_owners:
+            donor_tag = target_owners[0]
+            # Try to be specific: Owner of the first state
+            if not known_old_owners and states_clean:
+                first_state_owners = self.scan_state_region_owners(states_clean[0])
+                clean_new_check = new_tag.replace("c:", "").strip().upper()
+                valid_donors = [o for o in first_state_owners if o.replace("c:", "").strip().upper() != clean_new_check]
+                if valid_donors:
+                    donor_tag = valid_donors[0]
+
+            self.ensure_country_history_exists(new_tag, donor_tag, target_states=states_clean)
 
         # 1. Transfer Ownership
         # If known_old_owners is provided (Targeted Transfer), we restrict to those.
@@ -3147,6 +3188,7 @@ class Vic3Logic:
             ("common/history/trade", True),
             ("common/history/treaties", True),
             ("common/history/power_blocs", True),
+            ("common/history/lobbies/00_lobbies.txt", False),
             ("common/religions", True),
             ("common/journal_entries", True),
             ("common/laws", True),
@@ -6439,6 +6481,109 @@ class Vic3Logic:
         self.cleanup_power_bloc_membership(old_tag)
         self.clean_transferred_state_references(transferred_states)
         self.sanitize_buildings(old_tag, new_tag, transferred_states)
+        self.clean_lobbies_for_annexed(old_tag)
+
+    def clean_lobbies_for_annexed(self, tag):
+        """Scans lobbies file and removes any lobby for or targeting the annexed tag."""
+        lobby_file = os.path.join(self.mod_path, "common/history/lobbies/00_lobbies.txt")
+        if not os.path.exists(lobby_file): return
+
+        clean_tag = tag.replace("c:", "").strip()
+
+        try:
+            with open(lobby_file, 'r', encoding='utf-8-sig') as f: content = f.read()
+        except:
+            with open(lobby_file, 'r', encoding='utf-8') as f: content = f.read()
+
+        changed = False
+
+        # 1. Remove entire lobby blocks for the annexed tag (c:TAG = { ... })
+        cursor = 0
+        while True:
+            # Search for c:TAG ?= { or c:TAG = {
+            m = re.search(r"(?:^|\s)c:" + re.escape(clean_tag) + r"\s*(\?=|:|=)?\s*\{", content[cursor:], re.IGNORECASE)
+            if not m: break
+
+            s_idx = cursor + m.start()
+            # find block content from start of brace
+            brace_pos = cursor + m.end() - 1
+            _, e_idx = self.find_block_content(content, brace_pos)
+
+            if e_idx:
+                # Remove the block
+                content = content[:s_idx] + content[e_idx:]
+                changed = True
+                # Reset cursor to s_idx to continue searching from deletion point
+                cursor = s_idx
+            else:
+                cursor = brace_pos + 1
+
+        # 2. Remove specific lobby definitions targeting the annexed tag (target = c:TAG)
+        # We need to iterate through all country blocks
+        cursor = 0
+        while True:
+            # Find any country block c:TAG = {
+            m = re.search(r"(?:^|\s)c:([A-Za-z0-9_]+)\s*(\?=|:|=)?\s*\{", content[cursor:], re.IGNORECASE)
+            if not m: break
+
+            country_tag_start = cursor + m.start()
+            brace_pos = cursor + m.end() - 1
+            s_inner, e_inner = self.find_block_content(content, brace_pos)
+
+            if s_inner:
+                block_inner = content[s_inner+1:e_inner-1]
+
+                # Check if this block contains a lobby targeting our tag
+                # Regex for: create_political_lobby = { ... target = c:TAG ... }
+                # We need to parse individual create_political_lobby blocks
+
+                new_inner_parts = []
+                inner_cursor = 0
+                inner_changed = False
+
+                while True:
+                    lm = re.search(r"create_political_lobby\s*=\s*\{", block_inner[inner_cursor:])
+                    if not lm:
+                        new_inner_parts.append(block_inner[inner_cursor:])
+                        break
+
+                    lobby_start = inner_cursor + lm.start()
+                    new_inner_parts.append(block_inner[inner_cursor:lobby_start])
+
+                    l_brace = lobby_start + lm.end() - 1
+                    ls, le = self.find_block_content(block_inner, l_brace)
+
+                    if ls:
+                        lobby_content = block_inner[ls+1:le-1]
+
+                        # Check target
+                        if re.search(r"target\s*=\s*c:" + re.escape(clean_tag) + r"\b", lobby_content, re.IGNORECASE):
+                            self.log(f"[LOBBY] Removing lobby in owner block targeting {clean_tag}")
+                            inner_changed = True
+                            # Skip adding this lobby block
+                        else:
+                            new_inner_parts.append(block_inner[lobby_start:le])
+
+                        inner_cursor = le
+                    else:
+                        new_inner_parts.append(block_inner[lobby_start:])
+                        break
+
+                if inner_changed:
+                    new_inner_block = "".join(new_inner_parts)
+                    content = content[:s_inner+1] + new_inner_block + content[e_inner-1:]
+                    changed = True
+                    # Recalculate e_idx based on length change
+                    diff = len(new_inner_block) - len(block_inner)
+                    cursor = e_inner + diff
+                else:
+                    cursor = e_inner
+            else:
+                cursor = brace_pos + 1
+
+        if changed:
+            with open(lobby_file, 'w', encoding='utf-8-sig') as f: f.write(content)
+            self.log(f"[LOBBY] Cleaned up lobbies associated with {clean_tag}", 'success')
 
 # =============================================================================
 #  GUI IMPLEMENTATION
@@ -6866,27 +7011,74 @@ class StateManager:
                 if o not in pops_by_owner: pops_by_owner[o] = []
                 pops_by_owner[o].append(p)
 
-            # Valid Vic3 State Pops Structure: POPS = { s:STATE = { region_state:TAG = { ... } } }
-            pop_content = "\nPOPS = {\n"
             # Ensure proper s:STATE_ID format
             s_key = new_state_id if new_state_id.startswith("STATE_") else f"STATE_{new_state_id}"
-            pop_content += f"\ts:{s_key} = {{\n"
 
+            # Prepare new pops string per owner
+            pops_to_add_by_owner = {} # owner -> str
             for owner, p_list in pops_by_owner.items():
-                pop_content += f"\t\tregion_state:{owner} = {{\n"
+                pop_str = ""
                 for p in p_list:
                     # Only write religion if valid
                     rel_line = f"\n\t\t\treligion = {p['religion']}" if p['religion'] else ""
-                    pop_content += f"\t\t\tcreate_pop = {{\n\t\t\t\tculture = {p['culture']}{rel_line}\n\t\t\t\tsize = {p['size']}\n\t\t\t}}\n"
-                pop_content += "\t\t}\n"
-            pop_content += "\t}\n}\n"
+                    pop_str += f"\n\t\t\tcreate_pop = {{\n\t\t\t\tculture = {p['culture']}{rel_line}\n\t\t\t\tsize = {p['size']}\n\t\t\t}}"
+                pops_to_add_by_owner[owner] = pop_str
 
-            final_content = pop_content
+            # Read Existing
+            existing_content = ""
             if os.path.exists(new_pop_file):
                 try:
-                    with open(new_pop_file, 'r', encoding='utf-8-sig') as f: existing = f.read()
-                    final_content = existing + "\n" + pop_content
+                    with open(new_pop_file, 'r', encoding='utf-8-sig') as f: existing_content = f.read()
                 except: pass
+
+            if not existing_content.strip():
+                existing_content = "POPS = {\n}"
+
+            if "POPS" not in existing_content:
+                existing_content += "\nPOPS = {\n}"
+
+            final_content = existing_content
+
+            # Inject into correct structure
+            # 1. Find s:STATE
+            s_start, s_end = self.logic.get_block_range_safe(final_content, f"s:{s_key}")
+
+            if s_start is None:
+                # Append s:STATE block to POPS
+                p_s, p_e = self.logic.get_block_range_safe(final_content, "POPS")
+                if p_s is not None:
+                    # Append inside POPS
+                    insert_pos = p_e - 1
+                    new_state_block = f"\n\ts:{s_key} = {{\n\t}}"
+                    final_content = final_content[:insert_pos] + new_state_block + final_content[insert_pos:]
+                    # Update s_start/end
+                    s_start = insert_pos + 1 # rough approx, will find next
+
+            # Re-find state block after possible insertion
+            s_start, s_end = self.logic.get_block_range_safe(final_content, f"s:{s_key}")
+
+            if s_start is not None:
+                state_block = final_content[s_start:s_end]
+
+                # For each owner, find or create region_state
+                for owner, p_str in pops_to_add_by_owner.items():
+                    # Regex for region_state:TAG
+                    rs_pat = re.compile(r"region_state:(c:)?" + re.escape(owner) + r"\s*=\s*\{", re.IGNORECASE)
+                    m = rs_pat.search(state_block)
+
+                    if m:
+                        # Append to existing region_state
+                        rs_s, rs_e = self.logic.find_block_content(state_block, m.end()-1)
+                        if rs_s:
+                            # Insert before closing brace of region_state
+                            state_block = state_block[:rs_e-1] + p_str + "\n\t\t" + state_block[rs_e-1:]
+                    else:
+                        # Append new region_state to state block
+                        last_brace = state_block.rfind('}')
+                        new_rs = f"\n\t\tregion_state:{owner} = {{{p_str}\n\t\t}}"
+                        state_block = state_block[:last_brace] + new_rs + "\n\t" + state_block[last_brace:]
+
+                final_content = final_content[:s_start] + state_block + final_content[s_end:]
 
             with open(new_pop_file, 'w', encoding='utf-8-sig') as f: f.write(final_content)
             self.logic.log(f"[ASSETS] Transferred {len(new_pops_list)} pop groups to {new_state_id}")
@@ -7716,11 +7908,11 @@ class StateManager:
         for folder in folders:
             target_dir = os.path.join(self.logic.mod_path, "common/history", folder)
             if not os.path.exists(target_dir): continue
-            
+
             # Find file containing s:OLD_STATE
             old_file_path = None
             old_file_content = None
-            
+
             for root, _, files in os.walk(target_dir):
                 for file in files:
                     if not file.endswith(".txt"): continue
@@ -7729,37 +7921,37 @@ class StateManager:
                         with open(path, 'r', encoding='utf-8-sig') as f: c = f.read()
                     except:
                         with open(path, 'r', encoding='utf-8') as f: c = f.read()
-                    
+
                     if re.search(r"s:" + re.escape(old_state_id) + r"\s*=\s*\{", c):
                         old_file_path = path
                         old_file_content = c
                         break
                 if old_file_path: break
-            
+
             if old_file_path and old_file_content:
                 s, e = self.logic.get_block_range_safe(old_file_content, f"s:{old_state_id}")
                 if s is not None:
                     state_block = old_file_content[s:e]
-                    
+
                     # Find region_state:TAG block inside
                     rs_pat = re.compile(r"region_state:" + re.escape(tag) + r"\s*=\s*\{")
                     m_rs = rs_pat.search(state_block)
-                    
+
                     if m_rs:
                         rs_s, rs_e = self.logic.find_block_content(state_block, m_rs.end() - 1)
                         if rs_s:
-                            rs_full = state_block[m_rs.start():rs_e] 
+                            rs_full = state_block[m_rs.start():rs_e]
                             rs_body = state_block[rs_s+1:rs_e-1]
-                            
+
                             # Remove from old file
                             new_state_block = state_block[:m_rs.start()] + state_block[rs_e:]
                             new_file_content = old_file_content[:s] + new_state_block + old_file_content[e:]
                             with open(old_file_path, 'w', encoding='utf-8-sig') as f: f.write(new_file_content)
-                            
+
                             # Add to new state file
                             new_file_path = None
                             new_file_content = None
-                            
+
                             for root, _, files in os.walk(target_dir):
                                 for file in files:
                                     if not file.endswith(".txt"): continue
@@ -7768,20 +7960,20 @@ class StateManager:
                                         with open(path, 'r', encoding='utf-8-sig') as f: c = f.read()
                                     except:
                                         with open(path, 'r', encoding='utf-8') as f: c = f.read()
-                                    
+
                                     if re.search(r"s:" + re.escape(new_state_id) + r"\s*=\s*\{", c):
                                         new_file_path = path
                                         new_file_content = c
                                         break
                                 if new_file_path: break
-                            
+
                             if not new_file_path:
                                 new_file_path = os.path.join(target_dir, f"99_custom_{new_state_id}.txt")
                                 wrapper = "POPS" if folder == "pops" else "BUILDINGS"
                                 new_file_content = f"{wrapper} = {{\n\ts:{new_state_id} = {{\n\t}}\n}}"
                                 if os.path.exists(new_file_path):
                                      with open(new_file_path, 'r', encoding='utf-8-sig') as f: new_file_content = f.read()
-                            
+
                             ns, ne = self.logic.get_block_range_safe(new_file_content, f"s:{new_state_id}")
                             if ns is not None:
                                 ns_block = new_file_content[ns:ne]
@@ -7792,7 +7984,7 @@ class StateManager:
                                         to_append = rs_body
                                         if folder == "buildings":
                                             to_append = re.sub(r'region\s*=\s*"(s:)?' + re.escape(old_state_id) + r'"', f'region = "{new_state_id}"', to_append)
-                                        
+
                                         updated_ns_rs = ns_block[nm_rs.start():nrs_e-1] + "\n" + to_append + "\n\t\t}"
                                         updated_ns_block = ns_block[:nm_rs.start()] + updated_ns_rs + ns_block[nrs_e:]
                                         new_file_content = new_file_content[:ns] + updated_ns_block + new_file_content[ne:]
@@ -7800,11 +7992,11 @@ class StateManager:
                                     to_append = rs_full
                                     if folder == "buildings":
                                         to_append = re.sub(r'region\s*=\s*"(s:)?' + re.escape(old_state_id) + r'"', f'region = "{new_state_id}"', to_append)
-                                        
+
                                     last_brace = ns_block.rfind('}')
                                     updated_ns_block = ns_block[:last_brace] + "\n\t\t" + to_append + "\n\t}"
                                     new_file_content = new_file_content[:ns] + updated_ns_block + new_file_content[ne:]
-                                
+
                                 with open(new_file_path, 'w', encoding='utf-8-sig') as f: f.write(new_file_content)
                                 self.logic.log(f"Moved orphaned {folder} for {tag} from {old_state_id} to {new_state_id}")
 
@@ -7814,7 +8006,7 @@ class StateManager:
     def _move_orphaned_military(self, old_state, tag, new_state):
         mil_dir = os.path.join(self.logic.mod_path, "common/history/military_formations")
         if not os.path.exists(mil_dir): return
-        
+
         old_clean = self.logic.normalize_state_key(old_state).replace("s:", "")
         new_clean = self.logic.normalize_state_key(new_state).replace("s:", "")
         clean_tag = tag.replace("c:", "")
@@ -7827,19 +8019,19 @@ class StateManager:
                     with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
                 except:
                     with open(path, 'r', encoding='utf-8') as f: content = f.read()
-                
+
                 current_idx = 0
                 file_mod = False
                 new_content = content
-                
+
                 while True:
                     c_start, c_end = self.logic.get_block_range_safe(new_content, f"c:{clean_tag}", current_idx)
                     if c_start is None: break
-                    
+
                     block = new_content[c_start:c_end]
-                    
+
                     pat = re.compile(r"state_region\s*=\s*(?:s:)?\"?" + re.escape(old_clean) + r"\"?\b")
-                    
+
                     if pat.search(block):
                         new_block = pat.sub(f"state_region = s:{new_clean}", block)
                         new_content = new_content[:c_start] + new_block + new_content[c_end:]
@@ -7848,7 +8040,7 @@ class StateManager:
                         current_idx = c_end + diff
                     else:
                         current_idx = c_end
-                
+
                 if file_mod:
                     with open(path, 'w', encoding='utf-8-sig') as f: f.write(new_content)
                     self.logic.log(f"Moved military units for {tag} from {old_clean} to {new_clean}")
@@ -11833,15 +12025,39 @@ class Vic3ProvincePainter(tk.Toplevel):
         if not self.pending_transfers:
             return messagebox.showinfo("Info", "No pending changes.")
 
-        # Group by (NewTag) -> (OldTag) -> [States]
-        # logic.transfer_ownership_batch(states_list, old_tag, new_tag)
-
-        grouped = {} # new -> { old -> set(states) }
+        # Optimization: Flatten transfer chains to only execute the latest instruction
+        # Map: (state, original_owner) -> final_owner
+        consolidated = {}
 
         for state, old, new in self.pending_transfers:
             if not old or old == "None": continue
             if old == new: continue
 
+            # 1. Update existing chains ending at 'old'
+            for key, target in list(consolidated.items()):
+                s, orig = key
+                if s == state and target == old:
+                    consolidated[key] = new
+
+            # 2. Start/Update chain for 'old'
+            consolidated[(state, old)] = new
+
+        # Filter out self-transfers and build final list
+        final_moves = []
+        for (state, old), new in consolidated.items():
+            if old != new:
+                final_moves.append((state, old, new))
+
+        if not final_moves:
+            self.pending_transfers = []
+            return messagebox.showinfo("Info", "All changes cancelled out.")
+
+        # Group by (NewTag) -> (OldTag) -> [States]
+        # logic.transfer_ownership_batch(states_list, old_tag, new_tag)
+
+        grouped = {} # new -> { old -> set(states) }
+
+        for state, old, new in final_moves:
             if new not in grouped: grouped[new] = {}
             if old not in grouped[new]: grouped[new][old] = set()
             grouped[new][old].add(state)
@@ -11971,7 +12187,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                     target_state_owners.add(o)
                     all_options.add(o)
 
-        if len(found_owners) > 1:
+        if len(all_options) > 1:
             # Construct ordered list: Target owners first
             sorted_target = sorted(list(target_state_owners))
             sorted_found = sorted(list(found_owners))
@@ -11986,6 +12202,10 @@ class Vic3ProvincePainter(tk.Toplevel):
             if not choice: return # Cancelled
             split_strategy = choice
             target_owner = tag
+        else:
+            # Single option available, auto-select it
+            if all_options:
+                target_owner = list(all_options)[0]
 
         if messagebox.askyesno("Confirm", f"Transfer {count} provinces to {self.custom_target_state}?"):
             affected_states = {self.custom_target_state}
