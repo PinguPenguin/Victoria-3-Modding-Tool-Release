@@ -543,23 +543,51 @@ class Vic3Logic:
                     if re.search(r"(?:^|\s)c:" + re.escape(clean_new) + r"(\?=|:|=)", content):
                         return # Exists
 
-        self.log(f"[INFO] History file for {clean_new} missing. Creating using default template...", 'info')
+        self.log(f"[INFO] History file for {clean_new} missing. Creating from {donor_tag}...", 'info')
+
+        ext_data = self.get_extended_history_data(donor_tag)
+        if not ext_data:
+            # Safe defaults if no donor
+            has_railway = False
+            if target_states:
+                # Check for railways in target states to add technology
+                for s in target_states:
+                    bldgs = self.scan_state_buildings(s)
+                    for b in bldgs:
+                        if b['type'] == "building_railway":
+                            has_railway = True
+                            break
+                    if has_railway: break
+
+            lines = [
+                "effect_starting_technology_tier_2_tech = yes",
+                "effect_starting_politics_conservative = yes"
+            ]
+            if has_railway:
+                lines.append("add_technology_researched = railways")
+
+            # Note: We don't add default laws to keep it clean as requested, assuming politics effect handles basic setup or game defaults
+        else:
+            lines = []
+            if ext_data.get("tech_tier"): lines.extend(ext_data["tech_tier"])
+            else: lines.append("effect_starting_technology_tier_1_tech = yes")
+
+            if ext_data.get("politics"): lines.extend(ext_data["politics"])
+            if ext_data.get("techs_researched"): lines.extend(ext_data["techs_researched"])
+            if ext_data.get("laws"): lines.extend(sorted(list(set(ext_data["laws"]))))
+            if ext_data.get("institutions"): lines.extend(ext_data["institutions"])
+            lines.append("set_tax_level = medium")
 
         # Name
         name, _ = self.load_country_localization(clean_new)
         if not name: name = clean_new.lower()
-        filename = f"{clean_new.lower()} - {name.lower()}.txt"
+        filename = f"{clean_new} - {name}.txt"
 
         os.makedirs(hist_dir, exist_ok=True)
         filepath = os.path.join(hist_dir, filename)
 
-        content = f"""COUNTRIES = {{
-\tc:{clean_new} ?= {{
-\t\teffect_starting_technology_tier_2_tech = yes
-\t\t
-\t\teffect_starting_politics_conservative = yes
-\t}}
-}}"""
+        body = "\n\t\t".join(lines)
+        content = f"COUNTRIES = {{\n\tc:{clean_new} ?= {{\n\t\t{body}\n\t}}\n}}"
 
         with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(content)
         self.log(f"[SUCCESS] Created history file: {filename}", 'success')
@@ -621,20 +649,69 @@ class Vic3Logic:
         # History
         hist_dir = os.path.join(self.mod_path, "common/history/countries")
         os.makedirs(hist_dir, exist_ok=True)
-        hist_file = os.path.join(hist_dir, f"{tag.lower()} - {name.lower()}.txt")
+        hist_file = os.path.join(hist_dir, f"{tag} - {name}.txt")
 
         # Extended Data Extraction
         ext_data = self.get_extended_history_data(old_tag)
         old_tag_details = self.load_country_history_details(old_tag)
         gov_type = old_tag_details.get("gov_type", "monarchy")
 
+        laws_block = ""
+        tech_tier_str = ""
+        techs_res_str = ""
+        politics_str = ""
+        inst_str = ""
+
+        if ext_data:
+            if ext_data["laws"]:
+                laws_block = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["laws"])))
+            if ext_data["tech_tier"]:
+                tech_tier_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["tech_tier"])))
+            if ext_data["techs_researched"]:
+                techs_res_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["techs_researched"])))
+            if ext_data["politics"]:
+                politics_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["politics"])))
+            if ext_data["institutions"]:
+                inst_str = "\n\t" + "\n\t".join(list(dict.fromkeys(ext_data["institutions"])))
+
+        if not laws_block:
+            laws_block = """
+    activate_law = law_type:law_monarchy
+    activate_law = law_type:law_autocracy
+    activate_law = law_type:law_peasant_levies
+    activate_law = law_type:law_land_tax
+""" if gov_type == "monarchy" else """
+    activate_law = law_type:law_presidential_republic
+    activate_law = law_type:law_census_voting
+    activate_law = law_type:law_national_militia
+    activate_law = law_type:law_per_capita_tax
+    activate_law = law_type:law_appointed_bureaucrats
+"""
+
+        if not tech_tier_str:
+             tech_tier_str = "effect_starting_technology_tier_1_tech = yes"
+
+        ig_ruler = "ig_landowners" if gov_type == "monarchy" else "ig_intelligentsia"
+
         hist_content = f"""COUNTRIES = {{
-\tc:{tag} ?= {{
-\t\teffect_starting_technology_tier_2_tech = yes
-\t\t
-\t\teffect_starting_politics_conservative = yes
-\t}}
-}}"""
+    c:{tag} ?= {{
+        {tech_tier_str}
+        set_tax_level = medium
+        {laws_block}
+        {politics_str}
+        {techs_res_str}
+        {inst_str}
+
+        create_character = {{
+            first_name = "Alexander"
+            last_name = "Modman"
+            birth_date = 1800.1.1
+            ruler = yes
+            interest_group = {ig_ruler}
+        }}
+    }}
+}}
+"""
         with open(hist_file, 'w', encoding='utf-8-sig') as f: f.write(hist_content)
 
         # Population History
@@ -6587,6 +6664,358 @@ class Vic3Logic:
 
 # =============================================================================
 #  GUI IMPLEMENTATION
+    def scan_military_formations(self, tag):
+        """Scans for existing military formations for a tag."""
+        formations = []
+        mil_dir = os.path.join(self.mod_path, "common/history/military_formations")
+        # Also check vanilla to be comprehensive? Usually we only edit mod files.
+        # If user wants to edit vanilla, they must copy it first. We can warn if only found in vanilla?
+        # For now scan mod only for editing.
+        
+        if not os.path.exists(mil_dir): return []
+
+        clean_tag = tag.replace("c:", "").strip()
+
+        for root, _, files in os.walk(mil_dir):
+            for file in files:
+                if not file.endswith(".txt"): continue
+                path = os.path.join(root, file)
+                try:
+                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
+                except:
+                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
+
+                # Find c:TAG block
+                cursor = 0
+                while True:
+                    # Match c:TAG = { or c:TAG ?= {
+                    m_tag = re.search(r"(?:^|\s)c:" + re.escape(clean_tag) + r"\s*(\?=|:|=)?\s*\{", content[cursor:])
+                    if not m_tag: break
+                    
+                    tag_start = cursor + m_tag.start()
+                    # Find block content
+                    s_tag, e_tag = self.find_block_content(content, cursor + m_tag.end() - 1)
+                    
+                    if s_tag:
+                        tag_block = content[s_tag:e_tag]
+                        
+                        # Search for create_military_formation inside tag block
+                        inner_cursor = 0
+                        while True:
+                            m_form = re.search(r"create_military_formation\s*=\s*\{", tag_block[inner_cursor:])
+                            if not m_form: break
+                            
+                            abs_form_start_in_block = inner_cursor + m_form.start()
+                            s_form, e_form = self.find_block_content(tag_block, inner_cursor + m_form.end() - 1)
+                            
+                            if s_form:
+                                form_inner = tag_block[s_form:e_form]
+                                
+                                # Parse Data
+                                f_data = {
+                                    "file": path,
+                                    # Indices in the original file
+                                    # We need reliable way to find it again.
+                                    # Storing "scope_id" (save_scope_as) is best if it exists.
+                                    # If not, maybe index? But file changes. 
+                                    # We will store the scope ID if present, else we might rely on Name + Type + Index order?
+                                    # Let's extract save_scope_as
+                                    "id": None, 
+                                    "name": "Unknown",
+                                    "type": "army",
+                                    "units": {},
+                                    "hq": ""
+                                }
+                                
+                                # Extract Name
+                                m_name = re.search(r'name\s*=\s*"([^"]+)"', form_inner)
+                                if m_name: f_data["name"] = m_name.group(1)
+                                else:
+                                    # Unquoted?
+                                    m_name_uq = re.search(r'name\s*=\s*([^\s}]+)', form_inner)
+                                    if m_name_uq: f_data["name"] = m_name_uq.group(1)
+
+                                # Extract Type
+                                m_type = re.search(r"type\s*=\s*([A-Za-z0-9_]+)", form_inner)
+                                if m_type: f_data["type"] = m_type.group(1)
+
+                                # Extract ID
+                                m_id = re.search(r"save_scope_as\s*=\s*([A-Za-z0-9_]+)", form_inner)
+                                if m_id: f_data["id"] = m_id.group(1)
+                                else:
+                                    # Generate a temporary pseudo-ID for UI tracking? 
+                                    # Or rely on name/file.
+                                    # We'll use file+offset in memory but that's fragile.
+                                    # Let's assign an internal index for now.
+                                    f_data["id"] = f"__internal_{len(formations)}"
+
+                                # Extract HQ
+                                m_hq = re.search(r"hq_region\s*=\s*([A-Za-z0-9_:]+)", form_inner)
+                                if m_hq: f_data["hq"] = m_hq.group(1)
+
+                                # Extract Units
+                                # combat_unit = { type = ... count = ... }
+                                u_cursor = 0
+                                while True:
+                                    m_unit = re.search(r"combat_unit\s*=\s*\{", form_inner[u_cursor:])
+                                    if not m_unit: break
+                                    
+                                    us, ue = self.find_block_content(form_inner, u_cursor + m_unit.end() - 1)
+                                    if us:
+                                        u_block = form_inner[us:ue]
+                                        # Parse type and count
+                                        ut_m = re.search(r"type\s*=\s*unit_type:([A-Za-z0-9_]+)", u_block)
+                                        uc_m = re.search(r"count\s*=\s*(\d+)", u_block)
+                                        
+                                        if ut_m and uc_m:
+                                            utype = ut_m.group(1)
+                                            ucount = int(uc_m.group(1))
+                                            
+                                            # Simplify keys
+                                            # Simplify keys
+                                            if "infantry" in utype: k = "infantry"
+                                            elif "artillery" in utype: k = "artillery"
+                                            elif any(x in utype for x in ["hussars", "cavalry", "dragoons", "lancers", "cuirassiers"]): k = "cavalry"
+                                            elif "man_o_war" in utype: k = "manowar"
+                                            elif "frigate" in utype or "monitor" in utype: k = "frigate"
+                                            elif "ironclad" in utype: k = "ironclad"
+                                            else: k = utype
+                                            
+                                            f_data["units"][k] = f_data["units"].get(k, 0) + ucount
+                                        
+                                        u_cursor = ue
+                                    else:
+                                        u_cursor += 1
+
+                                formations.append(f_data)
+                                inner_cursor = e_form
+                            else:
+                                inner_cursor += 1
+                        
+                        cursor = e_tag
+                    else:
+                        cursor += 1
+                        
+        return formations
+
+    def delete_military_formation(self, file_path, scope_id):
+        self.perform_auto_backup()
+        if not os.path.exists(file_path): return False
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8-sig') as f: content = f.read()
+        except:
+            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+
+        # We need to find the specific formation block again.
+        # If scope_id starts with __internal_, we can't reliably find it by ID.
+        # We must rely on searching structure or re-scanning?
+        # Actually, for deletion, identifying the exact block is critical.
+        # If we have save_scope_as, it's easy.
+        # If not, we have to match Name + Type + HQ?
+        # Let's support both.
+        
+        is_internal = scope_id.startswith("__internal_")
+        # For simplicity in this implementation, if internal ID, we might fail or need robust matching.
+        # But we pass the whole object usually? No, just ID here. 
+        # Let's pass the formation object dict instead of just ID?
+        # But method signature asked for file_path and ID/indices.
+        # Let's update method signature to `delete_military_formation(self, formation_data)`
+        return False # Placeholder if called directly, use overloaded below logic
+
+    def delete_formation_ui(self, formation_data):
+        self.perform_auto_backup()
+        file_path = formation_data['file']
+        fid = formation_data['id']
+        name = formation_data['name']
+        
+        if not os.path.exists(file_path): return False
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8-sig') as f: content = f.read()
+        except:
+            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+
+        # Locate the block
+        # Strategy: Iterate blocks, check match
+        
+        found_start = -1
+        found_end = -1
+        
+        cursor = 0
+        while True:
+            # Find create_military_formation
+            m = re.search(r"create_military_formation\s*=\s*\{", content[cursor:])
+            if not m: break
+            
+            abs_start = cursor + m.start()
+            s, e = self.find_block_content(content, cursor + m.end() - 1)
+            
+            if s:
+                block = content[s:e]
+                
+                # Check match
+                # 1. ID Match
+                m_id = re.search(r"save_scope_as\s*=\s*([A-Za-z0-9_]+)", block)
+                if m_id and m_id.group(1) == fid:
+                    found_start = abs_start
+                    found_end = e
+                    break
+                
+                # 2. Name Match (fallback if internal ID)
+                if fid.startswith("__internal_"):
+                    m_name = re.search(r'name\s*=\s*"([^"]+)"', block)
+                    if m_name and m_name.group(1) == name:
+                        # Good enough?
+                        found_start = abs_start
+                        found_end = e
+                        break
+            
+                cursor = e
+            else:
+                cursor += 1
+        
+        if found_start != -1:
+            # Remove content
+            # Also clean up empty country block?
+            # Replace with newline
+            new_content = content[:found_start] + f"# Deleted Formation {name}\n" + content[found_end:]
+            with open(file_path, 'w', encoding='utf-8-sig') as f: f.write(new_content)
+            self.log(f"[MIL] Deleted formation '{name}' from {os.path.basename(file_path)}")
+            return True
+            
+        return False
+
+    def save_military_formation(self, formation_data, new_name, new_units):
+        """
+        Updates an existing formation.
+        formation_data: original dict from scan
+        new_name: str
+        new_units: dict {'infantry': 10, ...}
+        """
+        self.perform_auto_backup()
+        file_path = formation_data['file']
+        fid = formation_data['id']
+        
+        if not os.path.exists(file_path): return False
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8-sig') as f: content = f.read()
+        except:
+            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+
+        found_start = -1
+        found_end = -1
+        block_inner_start = -1
+        block_inner_end = -1
+        
+        cursor = 0
+        while True:
+            m = re.search(r"create_military_formation\s*=\s*\{", content[cursor:])
+            if not m: break
+            
+            abs_start = cursor + m.start()
+            s, e = self.find_block_content(content, cursor + m.end() - 1)
+            
+            if s:
+                block = content[s:e]
+                
+                # Match
+                match = False
+                m_id = re.search(r"save_scope_as\s*=\s*([A-Za-z0-9_]+)", block)
+                if m_id and m_id.group(1) == fid: match = True
+                elif fid.startswith("__internal_"):
+                    m_name = re.search(r'name\s*=\s*"([^"]+)"', block)
+                    if m_name and m_name.group(1) == formation_data['name']: match = True
+                
+                if match:
+                    found_start = abs_start
+                    found_end = e
+                    block_inner_start = s
+                    block_inner_end = e
+                    break
+                
+                cursor = e
+            else:
+                cursor += 1
+                
+        if found_start != -1:
+            original_block = content[block_inner_start:block_inner_end] # includes braces? No, find_block_content returns indices of { and after }
+            # Wait, find_block_content returns (start_brace_index, end_brace_index + 1)
+            # So content[s:e] is "{ ... }" including braces.
+            
+            # We want to reconstruct the inside.
+            # But we must preserve other properties (location, type, graphics, etc.)
+            
+            # 1. Update Name
+            # Regex sub name
+            new_block = original_block
+            if 'name =' in new_block:
+                new_block = re.sub(r'name\s*=\s*"[^"]+"', f'name = "{new_name}"', new_block)
+                new_block = re.sub(r'name\s*=\s*[^\s"}]+', f'name = "{new_name}"', new_block) # unquoted catch
+            else:
+                # Insert name
+                new_block = new_block.replace('{', f'{{\n\t\tname = "{new_name}"', 1)
+            
+            # 2. Update Units
+            # We need to replace all combat_unit blocks with new ones.
+            # Strategy: Strip existing combat_units, append new ones.
+            
+            # Strip existing
+            while True:
+                mu = re.search(r"combat_unit\s*=\s*\{", new_block)
+                if not mu: break
+                ms, me = self.find_block_content(new_block, mu.end()-1)
+                if ms:
+                    new_block = new_block[:mu.start()] + new_block[me:]
+                else: break
+            
+            # Find insertion point (before last brace)
+            last_brace = new_block.rfind('}')
+            
+            # Construct new units
+            # We need a location (state_region) for units.
+            # We don't know the exact state_region if not stored in data? 
+            # scan extracted HQ, but units need state_region.
+            # We should probably preserve one valid state_region from original units if possible?
+            # Or scan it during read.
+            # Let's default to Capital or search for existing state_region usage in original block?
+            
+            # Extract a reference state from original block before stripping
+            ref_state = "s:STATE_UNKNOWN"
+            m_st = re.search(r"state_region\s*=\s*([A-Za-z0-9_:]+)", original_block)
+            if m_st: ref_state = m_st.group(1)
+            
+            units_str = ""
+            for u_type, u_count in new_units.items():
+                if u_count <= 0: continue
+                
+                # Map back to game keys
+                real_type = ""
+                if u_type == "infantry": real_type = "unit_type:combat_unit_type_line_infantry"
+                elif u_type == "artillery": real_type = "unit_type:combat_unit_type_cannon_artillery"
+                elif u_type == "cavalry": real_type = "unit_type:combat_unit_type_hussars"
+                elif u_type == "manowar": real_type = "unit_type:combat_unit_type_man_o_war"
+                elif u_type == "frigate": real_type = "unit_type:combat_unit_type_frigate"
+                elif u_type == "ironclad": real_type = "unit_type:combat_unit_type_ironclad"
+                else: real_type = f"unit_type:{u_type}" if not u_type.startswith("unit_type:") else u_type
+                
+                units_str += f"""
+        combat_unit = {{
+            type = {real_type}
+            state_region = {ref_state}
+            count = {u_count}
+        }}"""
+
+            new_block = new_block[:last_brace] + units_str + "\n\t}"
+            
+            final_content = content[:found_start] + "create_military_formation =" + new_block + content[found_end:]
+            
+            with open(file_path, 'w', encoding='utf-8-sig') as f: f.write(final_content)
+            self.log(f"[MIL] Updated formation '{new_name}'")
+            return True
+            
+        return False
 # =============================================================================
 
 class DemographicsMixer(ttk.Frame):
@@ -8192,20 +8621,29 @@ class App(tk.Tk):
         # 2. Navigation
         nav_frame = ttk.Frame(main_frame)
         nav_frame.pack(fill=tk.X, pady=(0, 5))
-        # Mod Manager button moved to header
-        ttk.Button(nav_frame, text="Transfer States", command=self.show_transfer_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame, text="Create Country", command=self.show_create_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame, text="Military Creator", command=self.show_military_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame, text="Modify Country", command=self.show_country_mod_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame, text="Diplomacy", command=self.show_diplomacy_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Configure grid columns to be equal width
+        for i in range(5):
+            nav_frame.columnconfigure(i, weight=1, uniform="nav")
+
+        ttk.Button(nav_frame, text="Transfer States", command=self.show_transfer_ui).grid(row=0, column=0, padx=5, sticky="ew")
+        ttk.Button(nav_frame, text="Create Country", command=self.show_create_ui).grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(nav_frame, text="Military Manager", command=self.show_military_ui).grid(row=0, column=2, padx=5, sticky="ew")
+        ttk.Button(nav_frame, text="Modify Country", command=self.show_country_mod_ui).grid(row=0, column=3, padx=5, sticky="ew")
+        ttk.Button(nav_frame, text="Diplomacy", command=self.show_diplomacy_ui).grid(row=0, column=4, padx=5, sticky="ew")
 
         nav_frame_2 = ttk.Frame(main_frame)
         nav_frame_2.pack(fill=tk.X, pady=(0, 10))
-        ttk.Button(nav_frame_2, text="Powerbloc Manager", command=self.show_power_bloc_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame_2, text="Religion/Culture", command=self.show_rel_cul_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame_2, text="State Manager", command=self.show_state_manager_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame_2, text="Journal/Event Manager", command=self.show_journal_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(nav_frame_2, text="Custom States", command=self.show_custom_states_ui).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        # Configure grid columns to be equal width
+        for i in range(5):
+            nav_frame_2.columnconfigure(i, weight=1, uniform="nav")
+
+        ttk.Button(nav_frame_2, text="Powerbloc Manager", command=self.show_power_bloc_ui).grid(row=0, column=0, padx=5, sticky="ew")
+        ttk.Button(nav_frame_2, text="Religion/Culture", command=self.show_rel_cul_ui).grid(row=0, column=1, padx=5, sticky="ew")
+        ttk.Button(nav_frame_2, text="State Manager", command=self.show_state_manager_ui).grid(row=0, column=2, padx=5, sticky="ew")
+        ttk.Button(nav_frame_2, text="Journal/Event Manager", command=self.show_journal_ui).grid(row=0, column=3, padx=5, sticky="ew")
+        ttk.Button(nav_frame_2, text="Custom States", command=self.show_custom_states_ui).grid(row=0, column=4, padx=5, sticky="ew")
 
         # 3. Dynamic Content
         self.content_frame = ttk.Frame(main_frame)
@@ -8577,8 +9015,9 @@ class App(tk.Tk):
         self.clear_content()
         self.mode = "MILITARY"
 
+        # --- Frame 1: Create New ---
         f = ttk.LabelFrame(self.content_frame, text="Create Military Formation", padding=15)
-        f.pack(fill=tk.X)
+        f.pack(fill=tk.X, pady=(0, 10))
 
         # Basic Info
         ttk.Label(f, text="Country Tag:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -8608,11 +9047,61 @@ class App(tk.Tk):
         self.mil_unit_frame = ttk.LabelFrame(f, text="Composition", padding=10)
         self.mil_unit_frame.grid(row=3, column=0, columnspan=4, sticky=tk.W+tk.E, pady=10)
 
+        ttk.Button(f, text="Create New Formation", command=self.start_create_military).grid(row=4, column=0, columnspan=4, pady=10)
+
         # Initialize inputs
         self.update_mil_inputs()
 
-        self.run_btn.config(text="Create Formation", command=self.start_create_military, state='normal')
+        self.run_btn.pack_forget() # Hide the main run button as we use local ones
 
+        # --- Frame 2: Manage Existing ---
+        m = ttk.LabelFrame(self.content_frame, text="Manage Existing Formations", padding=15)
+        m.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        # Controls
+        mc = ttk.Frame(m)
+        mc.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(mc, text="Tag to Manage:").pack(side=tk.LEFT)
+        # Reuse mil_tag or separate? Let's reuse for convenience
+        ttk.Entry(mc, textvariable=self.mil_tag, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(mc, text="Load Formations", command=self.load_military_formations).pack(side=tk.LEFT, padx=5)
+
+        # List
+        self.mil_listbox = tk.Listbox(m, height=8, bg="#424242", fg="#ECEFF1")
+        self.mil_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.mil_listbox.bind('<<ListboxSelect>>', self.on_formation_select)
+
+        # Edit Area
+        self.mil_edit_frame = ttk.LabelFrame(m, text="Edit Selected", padding=10)
+        self.mil_edit_frame.pack(fill=tk.X, pady=5)
+
+        # Name
+        ttk.Label(self.mil_edit_frame, text="Name:").grid(row=0, column=0, sticky=tk.W)
+        self.mil_edit_name = tk.StringVar()
+        ttk.Entry(self.mil_edit_frame, textvariable=self.mil_edit_name, width=25).grid(row=0, column=1, sticky=tk.W, padx=5)
+
+        # Dynamic Unit Edits
+        # Instead of fixed fields, let's use a text representation or a small dynamic grid?
+        # Fixed fields are safer for simple edits.
+        # We can detect type from selection and show Army/Navy fields.
+        self.mil_edit_units_frame = ttk.Frame(self.mil_edit_frame)
+        self.mil_edit_units_frame.grid(row=1, column=0, columnspan=4, pady=5, sticky=tk.W)
+
+        # Buttons
+        btn_f = ttk.Frame(self.mil_edit_frame)
+        btn_f.grid(row=2, column=0, columnspan=4, pady=5, sticky=tk.E)
+        
+        ttk.Button(btn_f, text="Delete Formation", command=self.execute_delete_formation).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_f, text="Update Formation", command=self.execute_update_formation).pack(side=tk.RIGHT, padx=5)
+
+        self.current_formations = [] # Data cache
+        self.selected_formation_index = -1
+        
+        # Unit Vars for Edit
+        self.mil_edit_u1 = tk.IntVar()
+        self.mil_edit_u2 = tk.IntVar()
+        self.mil_edit_u3 = tk.IntVar()
     def update_mil_inputs(self):
         # Clear existing widgets in unit frame
         for widget in self.mil_unit_frame.winfo_children():
@@ -8680,7 +9169,104 @@ class App(tk.Tk):
              threading.Thread(target=self.run_army_logic, args=(tag, name, state, u1, u2, u3), daemon=True).start()
         else:
              threading.Thread(target=self.run_navy_logic, args=(tag, name, state, u1, u2, u3), daemon=True).start()
+    def load_military_formations(self):
+        tag = self.logic.format_tag_clean(self.mil_tag.get())
+        if not tag: return messagebox.showerror("Error", "Tag required.")
+        
+        self.current_formations = self.logic.scan_military_formations(tag)
+        self.mil_listbox.delete(0, tk.END)
+        
+        for f in self.current_formations:
+            # Format: Name (Type) - HQ - X units
+            total_units = sum(f['units'].values())
+            display = f"{f['name']} ({f['type']}) - {f['hq']} - {total_units} units"
+            self.mil_listbox.insert(tk.END, display)
+            
+        self.log_message(f"Loaded {len(self.current_formations)} formations for {tag}", 'success')
 
+    def on_formation_select(self, event=None):
+        sel = self.mil_listbox.curselection()
+        if not sel: return
+        
+        idx = sel[0]
+        if idx >= len(self.current_formations): return
+        
+        self.selected_formation_index = idx
+        data = self.current_formations[idx]
+        
+        self.mil_edit_name.set(data['name'])
+        
+        # Build Unit Edit UI dynamically based on type
+        for w in self.mil_edit_units_frame.winfo_children(): w.destroy()
+        
+        # We use standard 3 columns for common types
+        # Map units to vars
+        units = data['units']
+        
+        if data['type'] == 'army':
+            ttk.Label(self.mil_edit_units_frame, text="Infantry:").grid(row=0, column=0)
+            self.mil_edit_u1.set(units.get('infantry', 0))
+            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u1, width=5).grid(row=0, column=1, padx=5)
+            
+            ttk.Label(self.mil_edit_units_frame, text="Artillery:").grid(row=0, column=2)
+            self.mil_edit_u2.set(units.get('artillery', 0))
+            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u2, width=5).grid(row=0, column=3, padx=5)
+            
+            ttk.Label(self.mil_edit_units_frame, text="Cavalry:").grid(row=0, column=4)
+            self.mil_edit_u3.set(units.get('cavalry', 0))
+            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u3, width=5).grid(row=0, column=5, padx=5)
+            
+        else: # Navy
+            ttk.Label(self.mil_edit_units_frame, text="Man-of-War:").grid(row=0, column=0)
+            self.mil_edit_u1.set(units.get('manowar', 0))
+            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u1, width=5).grid(row=0, column=1, padx=5)
+            
+            ttk.Label(self.mil_edit_units_frame, text="Frigate:").grid(row=0, column=2)
+            self.mil_edit_u2.set(units.get('frigate', 0))
+            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u2, width=5).grid(row=0, column=3, padx=5)
+            
+            ttk.Label(self.mil_edit_units_frame, text="Ironclad:").grid(row=0, column=4)
+            self.mil_edit_u3.set(units.get('ironclad', 0))
+            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u3, width=5).grid(row=0, column=5, padx=5)
+
+    def execute_update_formation(self):
+        if self.selected_formation_index < 0: return
+        
+        data = self.current_formations[self.selected_formation_index]
+        new_name = self.mil_edit_name.get().strip()
+        if not new_name: return messagebox.showerror("Error", "Name required.")
+        
+        # Gather units
+        new_units = {}
+        try:
+            if data['type'] == 'army':
+                new_units['infantry'] = int(self.mil_edit_u1.get())
+                new_units['artillery'] = int(self.mil_edit_u2.get())
+                new_units['cavalry'] = int(self.mil_edit_u3.get())
+            else:
+                new_units['manowar'] = int(self.mil_edit_u1.get())
+                new_units['frigate'] = int(self.mil_edit_u2.get())
+                new_units['ironclad'] = int(self.mil_edit_u3.get())
+        except: return messagebox.showerror("Error", "Units must be integers.")
+        
+        success = self.logic.save_military_formation(data, new_name, new_units)
+        if success:
+            messagebox.showinfo("Success", "Formation updated.")
+            self.load_military_formations() # Refresh
+        else:
+            messagebox.showerror("Error", "Could not find or update formation.")
+
+    def execute_delete_formation(self):
+        if self.selected_formation_index < 0: return
+        data = self.current_formations[self.selected_formation_index]
+        
+        if messagebox.askyesno("Confirm", f"Delete formation '{data['name']}'?"):
+            success = self.logic.delete_formation_ui(data)
+            if success:
+                messagebox.showinfo("Success", "Formation deleted.")
+                self.load_military_formations()
+            else:
+                messagebox.showerror("Error", "Could not delete formation.")
     def _rgb_to_hex(self, rgb):
         return f'#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}'
 
