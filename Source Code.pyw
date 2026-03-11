@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import shutil
 import traceback
@@ -4637,6 +4637,9 @@ class Vic3Logic:
         return result, total
 
     def save_state_demographics(self, state, region_tag, demographic_data, total_pop, retain_location=False):
+        state = self.format_state_clean(state)
+        if not state: return
+
         # 1. Get current pops to locate files & calculate owner shares
         current_pops = self.get_state_pops(state)
 
@@ -4744,14 +4747,17 @@ class Vic3Logic:
                 size = int((pct / 100.0) * owner_total)
                 if size <= 0: continue
 
-                new_pops_str += f"""
-		create_pop = {{
-			culture = {d['culture']}
-			religion = {d['religion']}
-			size = {size}
-		}}"""
+                religion = (d.get('religion') or '').strip()
+                religion_line = f"\n\t\t\treligion = {religion}" if religion else ""
 
-            if not new_pops_str: continue
+                new_pops_str += f"""
+\t\tcreate_pop = {{
+\t\t\tculture = {d['culture']}{religion_line}
+\t\t\tsize = {size}
+\t\t}}"""
+
+            new_entries = new_pops_str.strip("\n")
+            if not new_entries: continue
 
             # Inject for this owner
             s, e = self.get_block_range_safe(content, f"s:{state}")
@@ -4763,19 +4769,20 @@ class Vic3Logic:
                 if m:
                     # Insert inside existing region_state
                     rs_s, rs_e = self.find_block_content(state_block, m.end()-1)
-                    if rs_s:
-                        # Append to end of region_state block
-                        new_rs_block = state_block[m.start():rs_e-1] + new_pops_str + "\n\t\t}"
+                    if rs_s is not None:
+                        existing_inner = self._clean_inner_block_text(state_block[rs_s+1:rs_e-1])
+                        combined_inner = new_entries if not existing_inner else existing_inner + "\n" + new_entries
+                        new_rs_block = state_block[m.start():rs_s+1] + "\n" + combined_inner + "\n\t\t}"
                         state_block = state_block[:m.start()] + new_rs_block + state_block[rs_e:]
                         content = content[:s] + state_block + content[e:]
                 else:
                     # Create region_state
-                    new_rs = f"\n\t\tregion_state:{owner_tag} = {{\n{new_pops_str}\n\t\t}}"
+                    new_rs = f"\n\t\tregion_state:{owner_tag} = {{\n{new_entries}\n\t\t}}"
                     state_block = state_block[:state_block.rfind('}')] + new_rs + "\n\t}"
                     content = content[:s] + state_block + content[e:]
             else:
                 # Create state block
-                new_entry = f"\n\ts:{state} = {{\n\t\tregion_state:{owner_tag} = {{\n{new_pops_str}\n\t\t}}\n\t}}"
+                new_entry = f"\n\ts:{state} = {{\n\t\tregion_state:{owner_tag} = {{\n{new_entries}\n\t\t}}\n\t}}"
                 ps, pe = self.get_block_range_safe(content, "POPS")
                 if ps is not None:
                     content = content[:pe-1] + new_entry + "\n}" + content[pe:]
@@ -4783,6 +4790,33 @@ class Vic3Logic:
                     content += f"\nPOPS = {{{new_entry}\n}}"
 
         with open(dest_file, 'w', encoding='utf-8-sig') as f: f.write(content)
+
+    def _clean_inner_block_text(self, inner):
+        if not inner:
+            return ""
+
+        inner = inner.replace("\r\n", "\n").replace("\r", "\n")
+
+        lines = inner.split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        cleaned_lines = []
+        pending_blank = False
+
+        for line in lines:
+            stripped = line.rstrip()
+            if stripped.strip():
+                if pending_blank and cleaned_lines:
+                    cleaned_lines.append("")
+                cleaned_lines.append(stripped)
+                pending_blank = False
+            else:
+                pending_blank = True
+
+        return "\n".join(cleaned_lines)
 
     def _remove_pops_from_text(self, content, state, tag):
         cursor = 0
@@ -4831,8 +4865,12 @@ class Vic3Logic:
                              else:
                                  pop_cursor += 1
 
-                        rebuilt_inner = "".join(new_inner_parts)
-                        new_state_parts.append("{" + rebuilt_inner + "}")
+                        rebuilt_inner = self._clean_inner_block_text("".join(new_inner_parts))
+                        if rebuilt_inner:
+                            rebuilt_region_state = state_block[abs_start:rs_s+1] + "\n" + rebuilt_inner + "\n\t\t}"
+                        else:
+                            rebuilt_region_state = state_block[abs_start:rs_s+1] + "\n\t\t}"
+                        new_state_parts.append(rebuilt_region_state)
                     else:
                          new_state_parts.append(state_block[abs_start:rs_e])
 
