@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import shutil
 import traceback
@@ -39,8 +39,81 @@ class Vic3Logic:
         self.state_manager.load_state_regions()
 
     def set_vanilla_path(self, path):
-        self.vanilla_path = path
+        self.vanilla_path = self.normalize_vanilla_path(path)
         self.state_manager.load_state_regions()
+
+    def normalize_vanilla_path(self, path):
+        """Accept either the Victoria 3 root folder or the game subfolder and normalize to the root."""
+        if not path:
+            return ""
+
+        norm = os.path.normpath(path)
+        if os.path.basename(norm).lower() == "game":
+            parent = os.path.dirname(norm)
+            if os.path.isdir(os.path.join(norm, "common")) or os.path.isdir(os.path.join(norm, "map")) or os.path.isdir(os.path.join(norm, "map_data")):
+                return parent
+
+        return norm
+
+    def get_effective_vanilla_path(self):
+        """Returns a usable Victoria 3 install root, auto-detecting it when possible."""
+        normalized = self.normalize_vanilla_path(self.vanilla_path)
+        if normalized and os.path.exists(os.path.join(normalized, "game")):
+            self.vanilla_path = normalized
+            return normalized
+
+        detected = self.auto_detect_vanilla_path()
+        if detected:
+            self.vanilla_path = detected
+            return detected
+
+        return ""
+
+    def auto_detect_vanilla_path(self):
+        """Best-effort auto-detection of the Victoria 3 install root."""
+        candidates = []
+
+        # Common direct install locations.
+        for env_name in ("PROGRAMFILES(X86)", "PROGRAMFILES"):
+            base = os.environ.get(env_name)
+            if base:
+                steam_base = os.path.join(base, "Steam")
+                candidates.append(os.path.join(steam_base, "steamapps", "common", "Victoria 3"))
+
+        # Steam registry install path on Windows.
+        if os.name == "nt":
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+                    steam_path, _ = winreg.QueryValueEx(key, "SteamPath")
+                    if steam_path:
+                        candidates.append(os.path.join(steam_path, "steamapps", "common", "Victoria 3"))
+
+                        library_vdf = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
+                        if os.path.exists(library_vdf):
+                            try:
+                                with open(library_vdf, "r", encoding="utf-8", errors="ignore") as f:
+                                    vdf_content = f.read()
+                                for lib_path in re.findall(r'"path"\s+"([^"]+)"', vdf_content):
+                                    lib_path = lib_path.replace('\\\\', '\\')
+                                    candidates.append(os.path.join(lib_path, "steamapps", "common", "Victoria 3"))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # Return the first valid root we can confirm.
+        seen = set()
+        for candidate in candidates:
+            norm = self.normalize_vanilla_path(candidate)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+
+            if os.path.exists(os.path.join(norm, "game", "common", "country_definitions")):
+                return norm
+
+        return ""
 
     def safe_str(self, s):
         if not s: return ""
@@ -89,76 +162,166 @@ class Vic3Logic:
                     return True
         return False
 
+    def _parse_vic3_color_value(self, block):
+        """Parses a Vic3 color line from a block and returns (r, g, b) or None."""
+        c_match = re.search(
+            r"\bcolor\b\s*=\s*(hsv360|hsv|rgb)?\s*\{\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\}",
+            block,
+            re.IGNORECASE
+        )
+        if not c_match:
+            return None
+
+        c_type = (c_match.group(1) or "").lower()
+        v1 = float(c_match.group(2))
+        v2 = float(c_match.group(3))
+        v3 = float(c_match.group(4))
+
+        if c_type == "hsv360":
+            h = (v1 % 360.0) / 360.0
+            s = v2 / 100.0 if v2 > 1.0 else v2
+            v = v3 / 100.0 if v3 > 1.0 else v3
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+        if c_type == "hsv":
+            h = v1 if v1 <= 1.0 else (v1 % 360.0) / 360.0
+            s = v2 / 100.0 if v2 > 1.0 else v2
+            v = v3 / 100.0 if v3 > 1.0 else v3
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+        # RGB can be stored either as 0-255 integers or 0-1 floats.
+        if all(0.0 <= val <= 1.0 for val in (v1, v2, v3)) and any(val > 0.0 for val in (v1, v2, v3)):
+            return (
+                int(round(v1 * 255)),
+                int(round(v2 * 255)),
+                int(round(v3 * 255))
+            )
+
+        return (int(round(v1)), int(round(v2)), int(round(v3)))
+
+    def find_country_color(self, tag):
+        """Finds the effective color for a specific tag, with mod files overriding vanilla."""
+        clean_tag = (tag or "").replace("c:", "").strip().upper()
+        if not clean_tag:
+            return None
+
+        effective_vanilla = self.get_effective_vanilla_path()
+
+        paths = []
+        if effective_vanilla:
+            paths.append(os.path.join(effective_vanilla, "game", "common", "country_definitions"))
+        if self.mod_path:
+            paths.append(os.path.join(self.mod_path, "common", "country_definitions"))
+
+        color = None
+        block_pattern = re.compile(
+            rf"(^|\s)(?:c:)?{re.escape(clean_tag)}\s*(?:\?=|=)\s*\{{",
+            re.MULTILINE | re.IGNORECASE
+        )
+
+        # Vanilla first, mod second, so later matches act as overrides.
+        for base_path in paths:
+            if not os.path.exists(base_path):
+                continue
+
+            for root, _, files in os.walk(base_path):
+                for file in files:
+                    if not file.endswith(".txt"):
+                        continue
+
+                    fpath = os.path.join(root, file)
+                    try:
+                        with open(fpath, "r", encoding="utf-8-sig") as f:
+                            content = f.read()
+                    except Exception:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+
+                    cursor = 0
+                    while True:
+                        m = block_pattern.search(content, cursor)
+                        if not m:
+                            break
+
+                        start_idx = m.end() - 1
+                        _, end_idx = self.find_block_content(content, start_idx)
+                        if not end_idx:
+                            cursor = m.end()
+                            continue
+
+                        block = content[start_idx:end_idx]
+                        parsed = self._parse_vic3_color_value(block)
+                        if parsed is not None:
+                            color = parsed
+
+                        cursor = end_idx
+
+        return color
+
     def scan_all_country_colors(self):
         """Scans both mod and vanilla for country colors. Returns {tag: (r,g,b)}."""
         colors = {}
+        effective_vanilla = self.get_effective_vanilla_path()
+
         paths = []
-        if self.mod_path: paths.append(os.path.join(self.mod_path, "common/country_definitions"))
-        if self.vanilla_path: paths.append(os.path.join(self.vanilla_path, "game/common/country_definitions"))
+        if effective_vanilla:
+            paths.append(os.path.join(effective_vanilla, "game", "common", "country_definitions"))
+        if self.mod_path:
+            paths.append(os.path.join(self.mod_path, "common", "country_definitions"))
 
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
+        skip_blocks = {
+            "AGENTS", "TIERS", "TYPES", "CULTURES", "RELIGIONS",
+            "COUNTRIES", "COUNTRY_DEFINITIONS", "DYNAMIC_COUNTRIES"
+        }
+
+        block_pattern = re.compile(
+            r"^\s*(?:c:)?([A-Z][A-Z0-9_]{1,4})\s*(?:\?=|=)\s*\{",
+            re.MULTILINE
+        )
+
+        for base_path in paths:
+            if not os.path.exists(base_path):
+                continue
+
+            for root, _, files in os.walk(base_path):
                 for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
+                    if not file.endswith(".txt"):
+                        continue
 
-                    # Find tags and colors
-                    # c:TAG = { ... color = { r g b } ... }
+                    fpath = os.path.join(root, file)
+                    try:
+                        with open(fpath, "r", encoding="utf-8-sig") as f:
+                            content = f.read()
+                    except Exception:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+
                     cursor = 0
                     while True:
-                        # Find tag definition start
-                        # Matches start of line or space + TAG + space + =
-                        # But more reliably: TAG = {
-                        # Standard paradox syntax: TAG = { ... }
-                        m = re.search(r"(?:^|\s)([A-Za-z0-9_]{3,})\s*=\s*\{", content[cursor:])
-                        if not m: break
+                        m = block_pattern.search(content, cursor)
+                        if not m:
+                            break
+
                         tag = m.group(1).upper()
-                        if tag in ["AGENTS", "TIERS", "TYPES", "CULTURES", "RELIGIONS"]: # Skip non-country blocks if any
-                             cursor += m.end()
-                             continue
+                        if tag in skip_blocks:
+                            cursor = m.end()
+                            continue
 
-                        start_idx = cursor + m.end() - 1
+                        start_idx = m.end() - 1
                         _, end_idx = self.find_block_content(content, start_idx)
+                        if not end_idx:
+                            cursor = m.end()
+                            continue
 
-                        if end_idx:
-                            block = content[start_idx:end_idx]
-                            # Look for color
-                            # color = { r g b } or color = rgb { r g b } or color = hsv { ... } or color = hsv360 { ... }
-                            c_match = re.search(r"color\s*=\s*(hsv360|hsv|rgb)?\s*\{\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\}", block, re.IGNORECASE)
-                            if c_match:
-                                c_type = c_match.group(1)
-                                v1, v2, v3 = float(c_match.group(2)), float(c_match.group(3)), float(c_match.group(4))
-                                rgb = (0,0,0)
-                                if c_type and c_type.lower() == 'hsv360':
-                                    h = v1 / 360.0
-                                    s = v2 / 100.0
-                                    v = v3 / 100.0
-                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-                                    rgb = (int(r * 255), int(g * 255), int(b * 255))
-                                elif c_type and c_type.lower() == 'hsv':
-                                    h = v1 if v1 <= 1.0 else v1/360.0
-                                    s = v2 if v2 <= 1.0 else v2/100.0
-                                    v = v3 if v3 <= 1.0 else v3/100.0
-                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-                                    rgb = (int(r * 255), int(g * 255), int(b * 255))
-                                else:
-                                    # rgb 0-255 or 0-1
-                                    if v1 <= 1.0 and v2 <= 1.0 and v3 <= 1.0 and (v1 > 0 or v2 > 0 or v3 > 0):
-                                         rgb = (int(v1*255), int(v2*255), int(v3*255))
-                                    else:
-                                         rgb = (int(v1), int(v2), int(v3))
+                        block = content[start_idx:end_idx]
+                        parsed = self._parse_vic3_color_value(block)
+                        if parsed is not None:
+                            colors[tag] = parsed
 
-                                # Mod overrides vanilla
-                                if tag not in colors or p.startswith(self.mod_path):
-                                    colors[tag] = rgb
+                        cursor = end_idx
 
-                            cursor = end_idx
-                        else:
-                            cursor += m.end()
         return colors
 
     def scan_definitions_for_options(self):
@@ -4637,9 +4800,6 @@ class Vic3Logic:
         return result, total
 
     def save_state_demographics(self, state, region_tag, demographic_data, total_pop, retain_location=False):
-        state = self.format_state_clean(state)
-        if not state: return
-
         # 1. Get current pops to locate files & calculate owner shares
         current_pops = self.get_state_pops(state)
 
@@ -4747,17 +4907,14 @@ class Vic3Logic:
                 size = int((pct / 100.0) * owner_total)
                 if size <= 0: continue
 
-                religion = (d.get('religion') or '').strip()
-                religion_line = f"\n\t\t\treligion = {religion}" if religion else ""
-
                 new_pops_str += f"""
-\t\tcreate_pop = {{
-\t\t\tculture = {d['culture']}{religion_line}
-\t\t\tsize = {size}
-\t\t}}"""
+		create_pop = {{
+			culture = {d['culture']}
+			religion = {d['religion']}
+			size = {size}
+		}}"""
 
-            new_entries = new_pops_str.strip("\n")
-            if not new_entries: continue
+            if not new_pops_str: continue
 
             # Inject for this owner
             s, e = self.get_block_range_safe(content, f"s:{state}")
@@ -4769,20 +4926,19 @@ class Vic3Logic:
                 if m:
                     # Insert inside existing region_state
                     rs_s, rs_e = self.find_block_content(state_block, m.end()-1)
-                    if rs_s is not None:
-                        existing_inner = self._clean_inner_block_text(state_block[rs_s+1:rs_e-1])
-                        combined_inner = new_entries if not existing_inner else existing_inner + "\n" + new_entries
-                        new_rs_block = state_block[m.start():rs_s+1] + "\n" + combined_inner + "\n\t\t}"
+                    if rs_s:
+                        # Append to end of region_state block
+                        new_rs_block = state_block[m.start():rs_e-1] + new_pops_str + "\n\t\t}"
                         state_block = state_block[:m.start()] + new_rs_block + state_block[rs_e:]
                         content = content[:s] + state_block + content[e:]
                 else:
                     # Create region_state
-                    new_rs = f"\n\t\tregion_state:{owner_tag} = {{\n{new_entries}\n\t\t}}"
+                    new_rs = f"\n\t\tregion_state:{owner_tag} = {{\n{new_pops_str}\n\t\t}}"
                     state_block = state_block[:state_block.rfind('}')] + new_rs + "\n\t}"
                     content = content[:s] + state_block + content[e:]
             else:
                 # Create state block
-                new_entry = f"\n\ts:{state} = {{\n\t\tregion_state:{owner_tag} = {{\n{new_entries}\n\t\t}}\n\t}}"
+                new_entry = f"\n\ts:{state} = {{\n\t\tregion_state:{owner_tag} = {{\n{new_pops_str}\n\t\t}}\n\t}}"
                 ps, pe = self.get_block_range_safe(content, "POPS")
                 if ps is not None:
                     content = content[:pe-1] + new_entry + "\n}" + content[pe:]
@@ -4790,33 +4946,6 @@ class Vic3Logic:
                     content += f"\nPOPS = {{{new_entry}\n}}"
 
         with open(dest_file, 'w', encoding='utf-8-sig') as f: f.write(content)
-
-    def _clean_inner_block_text(self, inner):
-        if not inner:
-            return ""
-
-        inner = inner.replace("\r\n", "\n").replace("\r", "\n")
-
-        lines = inner.split("\n")
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        while lines and not lines[-1].strip():
-            lines.pop()
-
-        cleaned_lines = []
-        pending_blank = False
-
-        for line in lines:
-            stripped = line.rstrip()
-            if stripped.strip():
-                if pending_blank and cleaned_lines:
-                    cleaned_lines.append("")
-                cleaned_lines.append(stripped)
-                pending_blank = False
-            else:
-                pending_blank = True
-
-        return "\n".join(cleaned_lines)
 
     def _remove_pops_from_text(self, content, state, tag):
         cursor = 0
@@ -4865,12 +4994,8 @@ class Vic3Logic:
                              else:
                                  pop_cursor += 1
 
-                        rebuilt_inner = self._clean_inner_block_text("".join(new_inner_parts))
-                        if rebuilt_inner:
-                            rebuilt_region_state = state_block[abs_start:rs_s+1] + "\n" + rebuilt_inner + "\n\t\t}"
-                        else:
-                            rebuilt_region_state = state_block[abs_start:rs_s+1] + "\n\t\t}"
-                        new_state_parts.append(rebuilt_region_state)
+                        rebuilt_inner = "".join(new_inner_parts)
+                        new_state_parts.append("{" + rebuilt_inner + "}")
                     else:
                          new_state_parts.append(state_block[abs_start:rs_e])
 
@@ -7327,13 +7452,13 @@ class StateManager:
         self.province_owner_map = {}
 
         paths = []
+        if self.logic.vanilla_path:
+            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
         if self.logic.mod_path:
             paths.append(os.path.join(self.logic.mod_path, "map/data/state_regions"))
             paths.append(os.path.join(self.logic.mod_path, "map_data/state_regions"))
-        if self.logic.vanilla_path:
-            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
 
-        for p in reversed(paths):
+        for p in paths:
             if not os.path.exists(p): continue
             for root, _, files in os.walk(p):
                 for file in files:
@@ -8750,7 +8875,7 @@ class App(tk.Tk):
         if path and os.path.exists(path):
             return path
 
-        messagebox.showinfo("Setup", r"Select the victoria 3/game folder, e.g: C:\Program Files (x86)\Steam\steamapps\common\Victoria 3\game")
+        messagebox.showinfo("Setup", r"Select the Victoria 3 install folder (either the game root or the game subfolder), e.g: C:\Program Files (x86)\Steam\steamapps\common\Victoria 3")
         folder = filedialog.askdirectory(title="Select Vanilla Game Directory")
         if folder:
             self.vanilla_path_var.set(folder)
@@ -12307,12 +12432,13 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.status_var.set("Ready. Left Click to Paint, Right Click to Pick.")
 
     def parse_state_regions(self):
-        # Scan map/data/state_regions
+        # Load vanilla first, then modded state regions so mod files override.
         paths = []
+        if self.logic.vanilla_path:
+            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
         if self.logic.mod_path:
             paths.append(os.path.join(self.logic.mod_path, "map/data/state_regions"))
             paths.append(os.path.join(self.logic.mod_path, "map_data/state_regions"))
-        if self.logic.vanilla_path: paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
 
         for p in paths:
             if not os.path.exists(p): continue
@@ -12375,7 +12501,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                     # s:STATE = { create_state = { country = c:TAG owned_provinces = { ... } } }
                     cursor = 0
                     while True:
-                        m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*=\s*\{", content[cursor:])
+                        m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*(?:\?=|=)\s*\{", content[cursor:])
                         if not m: break
                         state_name = m.group(1)
                         s_idx, e_idx = self.logic.find_block_content(content, cursor + m.end() - 1)
@@ -12473,6 +12599,31 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.scale_factor = max(self.scale_factor - 0.1, 0.05)
         self.start_loading(reload_image=True)
 
+    def get_owner_display_color(self, owner):
+        """Returns the real country color when available, otherwise a stable fallback."""
+        if not owner:
+            return None
+
+        clean_owner = owner.replace("c:", "").strip().upper()
+        if clean_owner in self.country_colors:
+            return self.country_colors[clean_owner]
+
+        # Lazy exact lookup covers cases where the bulk scan missed a tag or when
+        # the user only configured a mod path and we need to auto-detect vanilla.
+        exact = self.logic.find_country_color(clean_owner)
+        if exact is not None:
+            self.country_colors[clean_owner] = exact
+            return exact
+
+        # Deterministic fallback color so the political map stays readable even if
+        # a tag color still cannot be resolved.
+        seed = sum((i + 1) * ord(ch) for i, ch in enumerate(clean_owner))
+        hue = (seed % 360) / 360.0
+        sat = 0.58
+        val = 0.82
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        return (int(r * 255), int(g * 255), int(b * 255))
+
     def refresh_map(self):
         if self.province_indices is None: return
 
@@ -12501,7 +12652,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                 owner = self.province_owner_map.get(hex_code)
                 target_col = default_color
                 if owner:
-                    target_col = self.country_colors.get(owner, (150, 150, 150))
+                    target_col = self.get_owner_display_color(owner) or default_color
 
                 lookup_r[packed_rgb] = target_col[0]
                 lookup_g[packed_rgb] = target_col[1]
