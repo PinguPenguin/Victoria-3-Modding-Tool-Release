@@ -12223,15 +12223,38 @@ class Vic3ProvincePainter(tk.Toplevel):
 
         # Data Containers
         self.original_map_image = None # Original Full-Res PIL Image
+        self.original_rgb_array = None
         self.display_image = None # Tkinter Image
+        self.canvas_image_id = None
         self.province_to_state = {} # hex -> state_name
         self.state_province_map = {} # state_name -> [hex, hex, ...]
         self.province_owner_map = {} # hex -> owner_tag
         self.country_colors = {} # tag -> (r,g,b)
-        self.province_indices = None # Numpy array of hex colors (or mapped indices)
+        self.province_indices = None # Backward-compatible alias kept for older checks
+        self.province_rgb_array = None
+        self.province_label_map = None
+        self.packed_hex_cache = {}
+        self.unique_province_values = np.array([], dtype=np.int32)
+        self.unique_province_hexes = []
+        self.province_value_to_label = {}
+        self.province_bounds = {}
+        self.province_region_cache = {}
+        self.selection_overlay_items = {}
+        self.base_render_array = None
+        self.base_render_mode = None
+        self.base_render_scale = None
+        self.selected_packed_values = np.array([], dtype=np.int32)
+        self.selected_fill_colors = {}
         self.map_width = 0
         self.map_height = 0
+        self.source_width = 0
+        self.source_height = 0
         self.scale_factor = 0.25
+        self._load_request_id = 0
+        self._zoom_after_id = None
+        self._zoom_anchor = None
+        self._is_panning = False
+        self._viewport_after_id = None
 
         self.pending_transfers = [] # List of (state, old_tag, new_tag)
 
@@ -12245,6 +12268,419 @@ class Vic3ProvincePainter(tk.Toplevel):
 
         self._build_ui()
         self.after(100, self.start_loading)
+
+    def _invalidate_base_render(self):
+        self.base_render_array = None
+        self.base_render_mode = None
+        self.base_render_scale = None
+
+    def _clear_scaled_map_cache(self):
+        self._clear_selection_overlays()
+        self.province_indices = None
+        self.province_rgb_array = None
+        self.province_label_map = None
+        self.packed_hex_cache = {}
+        self.unique_province_values = np.array([], dtype=np.int32)
+        self.unique_province_hexes = []
+        self.province_value_to_label = {}
+        self.province_bounds = {}
+        self.province_region_cache = {}
+        self._invalidate_base_render()
+
+    def _refresh_selected_cache(self):
+        if not self.selected_provinces:
+            self.selected_packed_values = np.array([], dtype=np.int32)
+            self.selected_fill_colors = {}
+            return
+
+        packed_values = []
+        fill_colors = {}
+
+        for hex_code in self.selected_provinces:
+            try:
+                packed = self._hex_to_packed_rgb(hex_code)
+            except ValueError:
+                continue
+
+            packed_values.append(packed)
+            fallback_color = (
+                (packed >> 16) & 0xFF,
+                (packed >> 8) & 0xFF,
+                packed & 0xFF,
+            )
+            fill_colors[packed] = self._get_selected_fill_color(hex_code, fallback_color)
+
+        self.selected_packed_values = (
+            np.array(packed_values, dtype=np.int32)
+            if packed_values
+            else np.array([], dtype=np.int32)
+        )
+        self.selected_fill_colors = fill_colors
+
+    def _capture_view_anchor(self, event=None):
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+
+        if event is not None:
+            screen_x = min(max(event.x, 0), canvas_width)
+            screen_y = min(max(event.y, 0), canvas_height)
+        else:
+            screen_x = canvas_width / 2
+            screen_y = canvas_height / 2
+
+        return {
+            "world_x": self.canvas.canvasx(screen_x) / max(self.scale_factor, 0.0001),
+            "world_y": self.canvas.canvasy(screen_y) / max(self.scale_factor, 0.0001),
+            "rel_x": screen_x / canvas_width,
+            "rel_y": screen_y / canvas_height,
+        }
+
+    def _restore_view_anchor(self, anchor):
+        if not anchor:
+            return
+
+        self.update_idletasks()
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+
+        rel_x = min(max(anchor.get("rel_x", 0.5), 0.0), 1.0)
+        rel_y = min(max(anchor.get("rel_y", 0.5), 0.0), 1.0)
+
+        anchor_x = anchor.get("world_x", 0.0) * self.scale_factor
+        anchor_y = anchor.get("world_y", 0.0) * self.scale_factor
+
+        left = anchor_x - (canvas_width * rel_x)
+        top = anchor_y - (canvas_height * rel_y)
+
+        if self.map_width <= canvas_width:
+            x_fraction = 0.0
+        else:
+            max_x_fraction = 1.0 - (canvas_width / max(self.map_width, 1))
+            x_fraction = min(max(left / max(self.map_width, 1), 0.0), max_x_fraction)
+
+        if self.map_height <= canvas_height:
+            y_fraction = 0.0
+        else:
+            max_y_fraction = 1.0 - (canvas_height / max(self.map_height, 1))
+            y_fraction = min(max(top / max(self.map_height, 1), 0.0), max_y_fraction)
+
+        self.canvas.xview_moveto(x_fraction)
+        self.canvas.yview_moveto(y_fraction)
+
+    def _queue_viewport_refresh(self, delay=0):
+        if self._viewport_after_id is not None:
+            self.after_cancel(self._viewport_after_id)
+        self._viewport_after_id = self.after(delay, self._run_viewport_refresh)
+
+    def _run_viewport_refresh(self):
+        self._viewport_after_id = None
+        self.refresh_map()
+
+    def _update_virtual_map_size(self):
+        self.map_width = max(int(round(self.source_width * self.scale_factor)), 1)
+        self.map_height = max(int(round(self.source_height * self.scale_factor)), 1)
+
+    def _get_visible_viewport(self):
+        if self.original_rgb_array is None:
+            return None
+
+        self.update_idletasks()
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        view_left = max(int(self.canvas.canvasx(0)), 0)
+        view_top = max(int(self.canvas.canvasy(0)), 0)
+
+        x1 = min(view_left + canvas_width, self.map_width)
+        y1 = min(view_top + canvas_height, self.map_height)
+        render_width = max(x1 - view_left, 0)
+        render_height = max(y1 - view_top, 0)
+
+        final_img = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+        final_packed = None
+
+        if render_width <= 0 or render_height <= 0:
+            return {
+                "image": final_img,
+                "packed": final_packed,
+                "canvas_width": canvas_width,
+                "canvas_height": canvas_height,
+                "view_left": view_left,
+                "view_top": view_top,
+            }
+
+        display_x = view_left + np.arange(render_width, dtype=np.float32)
+        display_y = view_top + np.arange(render_height, dtype=np.float32)
+        src_x = np.clip((display_x / self.scale_factor).astype(np.int32), 0, self.source_width - 1)
+        src_y = np.clip((display_y / self.scale_factor).astype(np.int32), 0, self.source_height - 1)
+
+        visible_rgb = self.original_rgb_array[src_y[:, None], src_x[None, :]]
+        visible_packed = (
+            visible_rgb[:, :, 0].astype(np.int32) << 16
+        ) + (
+            visible_rgb[:, :, 1].astype(np.int32) << 8
+        ) + visible_rgb[:, :, 2].astype(np.int32)
+
+        final_img[:render_height, :render_width] = visible_rgb
+        final_packed = visible_packed
+
+        return {
+            "image": final_img,
+            "packed": final_packed,
+            "canvas_width": canvas_width,
+            "canvas_height": canvas_height,
+            "view_left": view_left,
+            "view_top": view_top,
+            "render_width": render_width,
+            "render_height": render_height,
+        }
+
+    def _queue_zoom(self, new_scale, anchor=None):
+        clamped_scale = min(max(new_scale, 0.05), 2.0)
+        if abs(clamped_scale - self.scale_factor) < 0.0001:
+            return
+
+        if anchor is None:
+            anchor = self._capture_view_anchor()
+
+        self.scale_factor = clamped_scale
+        self._zoom_anchor = anchor
+
+        if self._zoom_after_id is not None:
+            self.after_cancel(self._zoom_after_id)
+
+        self.status_var.set(f"Zooming to {int(round(self.scale_factor * 100))}%...")
+        self._zoom_after_id = self.after(10, self._apply_zoom)
+
+    def _apply_zoom(self):
+        self._zoom_after_id = None
+        if self.original_rgb_array is None:
+            return
+
+        try:
+            anchor = self._zoom_anchor
+            self._update_virtual_map_size()
+            self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
+            self._restore_view_anchor(anchor)
+            self.refresh_map()
+            self.status_var.set("Ready. Left Click to Paint, Right Click to Pick.")
+        except Exception as e:
+            self.status_var.set(f"Error: {e}")
+            traceback.print_exc()
+        finally:
+            self._zoom_anchor = None
+
+    def _build_province_bounds(self):
+        self.province_bounds = {}
+        if self.province_indices is None:
+            return
+
+        if self.province_label_map is not None and len(self.unique_province_values) > 0:
+            label_count = len(self.unique_province_values)
+            min_x = np.full(label_count, self.map_width, dtype=np.int32)
+            max_x = np.full(label_count, -1, dtype=np.int32)
+            min_y = np.full(label_count, self.map_height, dtype=np.int32)
+            max_y = np.full(label_count, -1, dtype=np.int32)
+
+            for y in range(self.map_height):
+                row = self.province_label_map[y]
+                seen, first_idx = np.unique(row, return_index=True)
+                if seen.size == 0:
+                    continue
+
+                _, reverse_idx = np.unique(row[::-1], return_index=True)
+                last_idx = (self.map_width - 1) - reverse_idx
+
+                np.minimum.at(min_x, seen, first_idx)
+                np.maximum.at(max_x, seen, last_idx)
+                np.minimum.at(min_y, seen, y)
+                np.maximum.at(max_y, seen, y)
+
+            for label in range(label_count):
+                if max_x[label] >= 0 and max_y[label] >= 0:
+                    self.province_bounds[label] = (
+                        int(min_x[label]),
+                        int(min_y[label]),
+                        int(max_x[label]),
+                        int(max_y[label]),
+                    )
+            return
+
+        for y in range(self.map_height):
+            row = self.province_indices[y]
+            seen, first_idx = np.unique(row, return_index=True)
+            if seen.size == 0:
+                continue
+
+            _, reverse_idx = np.unique(row[::-1], return_index=True)
+            last_idx = (self.map_width - 1) - reverse_idx
+
+            for packed_value, first_x, last_x in zip(seen.tolist(), first_idx.tolist(), last_idx.tolist()):
+                packed_key = int(packed_value)
+                bounds = self.province_bounds.get(packed_key)
+                if bounds is None:
+                    self.province_bounds[packed_key] = [int(first_x), y, int(last_x), y]
+                else:
+                    if first_x < bounds[0]:
+                        bounds[0] = int(first_x)
+                    if last_x > bounds[2]:
+                        bounds[2] = int(last_x)
+                    bounds[3] = y
+
+    def _packed_to_hex(self, packed):
+        packed_key = int(packed)
+        cached = self.packed_hex_cache.get(packed_key)
+        if cached is not None:
+            return cached
+
+        hex_code = "x{:02x}{:02x}{:02x}".format(
+            (packed_key >> 16) & 0xFF,
+            (packed_key >> 8) & 0xFF,
+            packed_key & 0xFF,
+        )
+        self.packed_hex_cache[packed_key] = hex_code
+        return hex_code
+
+    def _get_hex_at_canvas_pixel(self, ix, iy):
+        if self.original_rgb_array is None:
+            return None
+        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height:
+            return None
+
+        src_x = min(int(ix / max(self.scale_factor, 0.0001)), self.source_width - 1)
+        src_y = min(int(iy / max(self.scale_factor, 0.0001)), self.source_height - 1)
+        rgb = self.original_rgb_array[src_y, src_x]
+        packed = (int(rgb[0]) << 16) + (int(rgb[1]) << 8) + int(rgb[2])
+        return self._packed_to_hex(packed)
+
+    def _get_label_for_hex(self, hex_code):
+        try:
+            packed = self._hex_to_packed_rgb(hex_code)
+        except ValueError:
+            return None
+        return self.province_value_to_label.get(packed)
+
+    def _get_province_region_data(self, hex_code):
+        packed = self._hex_to_packed_rgb(hex_code)
+        cache_key = packed
+        compare_value = packed
+        source_array = self.province_indices
+
+        if self.province_label_map is not None:
+            label = self._get_label_for_hex(hex_code)
+            if label is None:
+                return None
+            cache_key = label
+            compare_value = label
+            source_array = self.province_label_map
+
+        cached = self.province_region_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bounds = self.province_bounds.get(cache_key)
+        if not bounds:
+            return None
+
+        min_x, min_y, max_x, max_y = bounds
+        x0 = max(min_x - 1, 0)
+        y0 = max(min_y - 1, 0)
+        x1 = min(max_x + 2, self.map_width)
+        y1 = min(max_y + 2, self.map_height)
+
+        value_slice = source_array[y0:y1, x0:x1]
+        selected_mask = value_slice == compare_value
+        outline_mask = self._get_selected_outline_mask(selected_mask, value_slice)
+
+        region_data = (x0, y0, x1, y1, selected_mask, outline_mask)
+        self.province_region_cache[cache_key] = region_data
+        return region_data
+
+    def _clear_selection_overlays(self):
+        for overlay in self.selection_overlay_items.values():
+            self.canvas.delete(overlay["item"])
+        self.selection_overlay_items = {}
+
+    def _sync_selection_overlays(self, full_refresh=False):
+        if full_refresh:
+            self._clear_selection_overlays()
+
+        selected = set(self.selected_provinces)
+        existing = set(self.selection_overlay_items)
+
+        for hex_code in existing - selected:
+            overlay = self.selection_overlay_items.pop(hex_code, None)
+            if overlay is not None:
+                self.canvas.delete(overlay["item"])
+
+        if self.province_indices is None:
+            return
+
+        base_render = self._get_base_render()
+        outline_color = np.array([18, 18, 18], dtype=np.uint8)
+
+        for hex_code in selected:
+            region_data = self._get_province_region_data(hex_code)
+            if region_data is None:
+                continue
+
+            x0, y0, x1, y1, selected_mask, outline_mask = region_data
+            overlay_rgba = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
+
+            if self.view_mode == "POLITICAL" and base_render is not None:
+                base_region = base_render[y0:y1, x0:x1]
+                selected_pixels = base_region[selected_mask].astype(np.uint16)
+                overlay_rgba[selected_mask, :3] = ((selected_pixels * 7) + (255 * 3)) // 10
+            else:
+                packed = self._hex_to_packed_rgb(hex_code)
+                fallback_color = (
+                    (packed >> 16) & 0xFF,
+                    (packed >> 8) & 0xFF,
+                    packed & 0xFF,
+                )
+                overlay_rgba[selected_mask, :3] = self._get_selected_fill_color(hex_code, fallback_color)
+
+            overlay_rgba[selected_mask, 3] = 255
+            overlay_rgba[outline_mask, :3] = outline_color
+            overlay_rgba[outline_mask, 3] = 255
+
+            photo = ImageTk.PhotoImage(Image.fromarray(overlay_rgba, mode="RGBA"))
+            existing_overlay = self.selection_overlay_items.get(hex_code)
+            if existing_overlay is None:
+                item_id = self.canvas.create_image(x0, y0, image=photo, anchor="nw")
+                self.selection_overlay_items[hex_code] = {"item": item_id, "image": photo}
+            else:
+                self.canvas.itemconfig(existing_overlay["item"], image=photo)
+                self.canvas.coords(existing_overlay["item"], x0, y0)
+                existing_overlay["image"] = photo
+
+    def _get_base_render(self):
+        if self.province_indices is None:
+            return None
+
+        if (
+            self.base_render_array is not None
+            and self.base_render_mode == self.view_mode
+            and self.base_render_scale == self.scale_factor
+        ):
+            return self.base_render_array
+
+        if self.view_mode == "PROVINCE" or self.province_label_map is None:
+            base = self.province_rgb_array
+        else:
+            default_color = (50, 50, 50)
+            palette = np.full((len(self.unique_province_values), 3), 50, dtype=np.uint8)
+
+            for label, hex_code in enumerate(self.unique_province_hexes):
+                owner = self.province_owner_map.get(hex_code)
+                if owner:
+                    palette[label] = self.get_owner_display_color(owner) or default_color
+
+            base = palette[self.province_label_map]
+
+        self.base_render_array = np.ascontiguousarray(base)
+        self.base_render_mode = self.view_mode
+        self.base_render_scale = self.scale_factor
+        return self.base_render_array
 
     def ask_split_choice(self, owners, options=None, default_tag=None):
         """Helper to ask user how to handle multiple owners."""
@@ -12361,12 +12797,13 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas = tk.Canvas(self.canvas_frame, bg="#101010", highlightthickness=0,
                                 xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
 
-        self.h_scroll.config(command=self.canvas.xview)
-        self.v_scroll.config(command=self.canvas.yview)
+        self.h_scroll.config(command=self.on_horizontal_scroll)
+        self.v_scroll.config(command=self.on_vertical_scroll)
 
         self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
 
         self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_right_click)
@@ -12376,26 +12813,55 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas.bind("<Button-5>", self.on_mousewheel)
         self.canvas.bind("<ButtonPress-2>", self.start_pan)
         self.canvas.bind("<B2-Motion>", self.do_pan)
+        self.canvas.bind("<ButtonRelease-2>", self.end_pan)
 
     def start_pan(self, event):
+        self._is_panning = True
+        self.canvas.configure(cursor="fleur")
         self.canvas.scan_mark(event.x, event.y)
+        return "break"
 
     def do_pan(self, event):
+        if not self._is_panning:
+            return "break"
         self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self._queue_viewport_refresh(0)
+        return "break"
+
+    def end_pan(self, event):
+        self._is_panning = False
+        self.canvas.configure(cursor="")
+        self._queue_viewport_refresh(0)
+        return "break"
+
+    def on_horizontal_scroll(self, *args):
+        self.canvas.xview(*args)
+        self._queue_viewport_refresh(0)
+
+    def on_vertical_scroll(self, *args):
+        self.canvas.yview(*args)
+        self._queue_viewport_refresh(0)
+
+    def on_canvas_configure(self, event):
+        self._queue_viewport_refresh(0)
 
     def on_mousewheel(self, event):
         num = getattr(event, 'num', None)
         delta = getattr(event, 'delta', 0)
+        anchor = self._capture_view_anchor(event)
         if num == 4 or delta > 0:
-            self.zoom_in()
+            self.zoom_in(anchor=anchor)
         elif num == 5 or delta < 0:
-            self.zoom_out()
+            self.zoom_out(anchor=anchor)
+        return "break"
 
     def start_loading(self, reload_image=True):
         self.status_var.set("Loading Data...")
-        threading.Thread(target=self.load_data, args=(reload_image,), daemon=True).start()
+        self._load_request_id += 1
+        load_id = self._load_request_id
+        threading.Thread(target=self.load_data, args=(load_id, reload_image), daemon=True).start()
 
-    def load_data(self, reload_image):
+    def load_data(self, load_id, reload_image):
         try:
             # Sync backend state manager first
             self.logic.state_manager.load_state_regions()
@@ -12406,6 +12872,10 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.state_province_map = {}
             self.province_owner_map = {}
             self.pending_transfers = []
+            self._invalidate_base_render()
+            if reload_image:
+                self.original_map_image = None
+                self.original_rgb_array = None
 
             # 1. Colors
             self.country_colors = self.logic.scan_all_country_colors()
@@ -12415,19 +12885,27 @@ class Vic3ProvincePainter(tk.Toplevel):
 
             # 3. History (State+Hex -> Owner)
             self.parse_history_states()
+            self._refresh_selected_cache()
 
             # 4. Map Image (Only if needed)
-            if reload_image or self.province_indices is None:
+            if reload_image or self.original_rgb_array is None:
                 self.load_province_map()
 
             # 5. Render (Schedule on Main Thread)
-            self.after(0, self.finish_loading_success)
+            self.after(0, lambda lid=load_id: self.finish_loading_success(lid))
 
         except Exception as e:
-            self.after(0, lambda: self.status_var.set(f"Error: {e}"))
+            self.after(0, lambda err=e, lid=load_id: self.finish_loading_error(lid, err))
             traceback.print_exc()
 
-    def finish_loading_success(self):
+    def finish_loading_error(self, load_id, error):
+        if load_id != self._load_request_id:
+            return
+        self.status_var.set(f"Error: {error}")
+
+    def finish_loading_success(self, load_id):
+        if load_id != self._load_request_id:
+            return
         self.refresh_map()
         self.status_var.set("Ready. Left Click to Paint, Right Click to Pick.")
 
@@ -12552,52 +13030,31 @@ class Vic3ProvincePainter(tk.Toplevel):
                             cursor += 1
 
     def load_province_map(self):
-        # Load cached or from disk
-        if self.original_map_image is None:
-            # Try mod then vanilla
+        if self.original_rgb_array is None:
             candidates = []
             if self.logic.mod_path:
                 candidates.append(os.path.join(self.logic.mod_path, "map/data/provinces.png"))
                 candidates.append(os.path.join(self.logic.mod_path, "map_data/provinces.png"))
-            if self.logic.vanilla_path: candidates.append(os.path.join(self.logic.vanilla_path, "game/map/data/provinces.png"))
+            if self.logic.vanilla_path:
+                candidates.append(os.path.join(self.logic.vanilla_path, "game/map/data/provinces.png"))
 
             path = next((x for x in candidates if os.path.exists(x)), None)
             if not path:
                 raise FileNotFoundError("provinces.png not found")
 
-            self.original_map_image = Image.open(path)
-            self.original_map_image.load() # Ensure loaded
+            self.original_map_image = Image.open(path).convert("RGB")
+            self.original_map_image.load()
+            self.original_rgb_array = np.ascontiguousarray(np.array(self.original_map_image, dtype=np.uint8))
+            self.source_height, self.source_width = self.original_rgb_array.shape[:2]
+            self._clear_scaled_map_cache()
 
-        # Downscale from original
-        img = self.original_map_image
-        w, h = img.size
-        new_w, new_h = int(w * self.scale_factor), int(h * self.scale_factor)
+        self._update_virtual_map_size()
 
-        # Limit minimum size
-        if new_w < 100 or new_h < 100:
-             new_w, new_h = 100, 100
+    def zoom_in(self, anchor=None):
+        self._queue_zoom(self.scale_factor + 0.1, anchor=anchor)
 
-        img_small = img.resize((new_w, new_h), resample=Image.Resampling.NEAREST)
-
-        self.map_width, self.map_height = new_w, new_h
-
-        # Convert to numpy array of indices (packed RGB)
-        arr = np.array(img_small) # (H, W, 3)
-        R = arr[:,:,0].astype(np.int32)
-        G = arr[:,:,1].astype(np.int32)
-        B = arr[:,:,2].astype(np.int32)
-        self.province_indices = (R << 16) + (G << 8) + B
-
-        # Clean up heavy RGB array
-        del arr
-
-    def zoom_in(self):
-        self.scale_factor = min(self.scale_factor + 0.1, 2.0)
-        self.start_loading(reload_image=True)
-
-    def zoom_out(self):
-        self.scale_factor = max(self.scale_factor - 0.1, 0.05)
-        self.start_loading(reload_image=True)
+    def zoom_out(self, anchor=None):
+        self._queue_zoom(self.scale_factor - 0.1, anchor=anchor)
 
     def get_owner_display_color(self, owner):
         """Returns the real country color when available, otherwise a stable fallback."""
@@ -12652,13 +13109,13 @@ class Vic3ProvincePainter(tk.Toplevel):
             expanded = grown
         return expanded
 
-    def _get_selected_outline_mask(self, selected_mask):
+    def _get_selected_outline_mask(self, selected_mask, label_slice):
         outline_mask = np.zeros_like(selected_mask, dtype=bool)
         if not np.any(selected_mask):
             return outline_mask
 
-        horizontal_diff = self.province_indices[:, 1:] != self.province_indices[:, :-1]
-        vertical_diff = self.province_indices[1:, :] != self.province_indices[:-1, :]
+        horizontal_diff = label_slice[:, 1:] != label_slice[:, :-1]
+        vertical_diff = label_slice[1:, :] != label_slice[:-1, :]
 
         outline_mask[:, 1:] |= selected_mask[:, 1:] & horizontal_diff
         outline_mask[:, :-1] |= selected_mask[:, :-1] & horizontal_diff
@@ -12671,113 +13128,91 @@ class Vic3ProvincePainter(tk.Toplevel):
         return outline_mask
 
     def refresh_map(self):
-        if self.province_indices is None: return
+        if self.original_rgb_array is None:
+            return
 
-        # Get unique colors from the index array
-        uniques = np.unique(self.province_indices)
+        viewport = self._get_visible_viewport()
+        if viewport is None:
+            return
 
-        # Initialize lookup arrays
-        # Max value 0xFFFFFF = 16777215
-        lookup_r = np.zeros(16777216, dtype=np.uint8)
-        lookup_g = np.zeros(16777216, dtype=np.uint8)
-        lookup_b = np.zeros(16777216, dtype=np.uint8)
+        final_img = viewport["image"]
+        view_packed = viewport.get("packed")
+        render_width = viewport.get("render_width", 0)
+        render_height = viewport.get("render_height", 0)
+        visible_region = final_img[:render_height, :render_width]
+        selected_values = self.selected_packed_values
+        outline_color = np.array([18, 18, 18], dtype=np.uint8)
 
-        if self.view_mode == "POLITICAL":
-            # Default grey
-            lookup_r[:] = 50; lookup_g[:] = 50; lookup_b[:] = 50
-            default_color = (50, 50, 50)
+        if view_packed is not None and render_width > 0 and render_height > 0:
+            unique_values = None
+            inverse_map = None
 
-            for packed_rgb in uniques:
-                # Unpack to Hex for lookup
-                r = (packed_rgb >> 16) & 0xFF
-                g = (packed_rgb >> 8) & 0xFF
-                b = packed_rgb & 0xFF
+            if self.view_mode == "POLITICAL":
+                unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
+                inverse_map = inverse.reshape(render_height, render_width)
+                palette = np.full((len(unique_values), 3), 50, dtype=np.uint8)
 
-                hex_code = "x{:02x}{:02x}{:02x}".format(r, g, b)
+                for idx, packed in enumerate(unique_values):
+                    owner = self.province_owner_map.get(self._packed_to_hex(packed))
+                    if owner:
+                        palette[idx] = self.get_owner_display_color(owner) or (50, 50, 50)
 
-                owner = self.province_owner_map.get(hex_code)
-                target_col = default_color
-                if owner:
-                    target_col = self.get_owner_display_color(owner) or default_color
+                visible_region[:, :] = palette[inverse_map]
 
-                lookup_r[packed_rgb] = target_col[0]
-                lookup_g[packed_rgb] = target_col[1]
-                lookup_b[packed_rgb] = target_col[2]
+            if selected_values.size > 0:
+                if unique_values is None or inverse_map is None:
+                    unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
+                    inverse_map = inverse.reshape(render_height, render_width)
 
-        else: # PROVINCE MODE
-            # Keep the province map visible, but make selected provinces readable.
+                selected_unique_mask = np.isin(unique_values, selected_values)
+                if np.any(selected_unique_mask):
+                    selected_mask = selected_unique_mask[inverse_map]
 
-            for packed_rgb in uniques:
-                r = (packed_rgb >> 16) & 0xFF
-                g = (packed_rgb >> 8) & 0xFF
-                b = packed_rgb & 0xFF
-                lookup_r[packed_rgb] = r
-                lookup_g[packed_rgb] = g
-                lookup_b[packed_rgb] = b
+                    if self.view_mode == "PROVINCE":
+                        highlight_palette = np.zeros((len(unique_values), 3), dtype=np.uint8)
+                        selected_indices = np.flatnonzero(selected_unique_mask)
+                        for idx in selected_indices:
+                            packed = int(unique_values[idx])
+                            highlight_palette[idx] = self.selected_fill_colors.get(
+                                packed,
+                                (
+                                    (packed >> 16) & 0xFF,
+                                    (packed >> 8) & 0xFF,
+                                    packed & 0xFF,
+                                ),
+                            )
+                        visible_region[selected_mask] = highlight_palette[inverse_map][selected_mask]
+                    else:
+                        selected_pixels = visible_region[selected_mask].astype(np.uint16)
+                        visible_region[selected_mask] = ((selected_pixels * 7) + (255 * 3)) // 10
 
-            for hex_code in self.selected_provinces:
-                try:
-                    val = self._hex_to_packed_rgb(hex_code)
-                    if val < 16777216:
-                        fallback_color = (
-                            (val >> 16) & 0xFF,
-                            (val >> 8) & 0xFF,
-                            val & 0xFF,
-                        )
-                        highlight = self._get_selected_fill_color(hex_code, fallback_color)
-                        lookup_r[val] = highlight[0]
-                        lookup_g[val] = highlight[1]
-                        lookup_b[val] = highlight[2]
-                except ValueError:
-                    pass
-
-        out_r = lookup_r[self.province_indices]
-        out_g = lookup_g[self.province_indices]
-        out_b = lookup_b[self.province_indices]
-
-        final_img = np.dstack((out_r, out_g, out_b))
-
-        if self.selected_provinces:
-            selected_values = []
-            for hex_code in self.selected_provinces:
-                try:
-                    selected_values.append(self._hex_to_packed_rgb(hex_code))
-                except ValueError:
-                    continue
-
-            if selected_values:
-                selected_array = np.array(selected_values, dtype=self.province_indices.dtype)
-                selected_mask = np.isin(self.province_indices, selected_array)
-
-                if self.view_mode == "POLITICAL" and np.any(selected_mask):
-                    selected_pixels = final_img[selected_mask].astype(np.uint16)
-                    final_img[selected_mask] = ((selected_pixels * 7) + (255 * 3)) // 10
-
-                outline_mask = self._get_selected_outline_mask(selected_mask)
-                if np.any(outline_mask):
-                    final_img[outline_mask] = np.array([18, 18, 18], dtype=np.uint8)
+                    outline_mask = self._get_selected_outline_mask(selected_mask, view_packed)
+                    if np.any(outline_mask):
+                        visible_region[outline_mask] = outline_color
 
         pil_img = Image.fromarray(final_img)
         self.display_image = ImageTk.PhotoImage(pil_img)
 
         self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
-        # Clear existing image items to prevent memory leaks/overdraw
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=self.display_image, anchor="nw")
+        if self.canvas_image_id is None:
+            self.canvas_image_id = self.canvas.create_image(
+                viewport["view_left"],
+                viewport["view_top"],
+                image=self.display_image,
+                anchor="nw",
+            )
+        else:
+            self.canvas.itemconfig(self.canvas_image_id, image=self.display_image)
+            self.canvas.coords(self.canvas_image_id, viewport["view_left"], viewport["view_top"])
 
     def on_click(self, event):
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
 
         ix, iy = int(x), int(y)
-        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height: return
-
-        # Identify Province from packed index
-        packed = self.province_indices[iy, ix]
-        r = (packed >> 16) & 0xFF
-        g = (packed >> 8) & 0xFF
-        b = packed & 0xFF
-        hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b).lower()
+        hex_code = self._get_hex_at_canvas_pixel(ix, iy)
+        if not hex_code:
+            return
 
         state = self.province_to_state.get(hex_code)
         owner = self.province_owner_map.get(hex_code, "None")
@@ -12790,6 +13225,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             else:
                 self.selected_provinces.add(hex_code)
                 self.status_var.set(f"Selected {hex_code}")
+            self._refresh_selected_cache()
             self.refresh_map()
         else:
             # Political Paint Mode
@@ -12807,6 +13243,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                         if self.province_owner_map.get(h) == owner:
                             self.province_owner_map[h] = new_tag
 
+                self._invalidate_base_render()
                 self.refresh_map()
                 self.status_var.set(f"Painted {state} ({owner} -> {new_tag})")
             else:
@@ -12816,13 +13253,9 @@ class Vic3ProvincePainter(tk.Toplevel):
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
         ix, iy = int(x), int(y)
-        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height: return
-
-        packed = self.province_indices[iy, ix]
-        r = (packed >> 16) & 0xFF
-        g = (packed >> 8) & 0xFF
-        b = packed & 0xFF
-        hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b).lower()
+        hex_code = self._get_hex_at_canvas_pixel(ix, iy)
+        if not hex_code:
+            return
 
         owner = self.province_owner_map.get(hex_code)
 
@@ -12835,6 +13268,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                     self.target_state_var.set("None")
                     self.status_var.set("Target State Deselected")
                     self.selected_provinces.clear()
+                    self._refresh_selected_cache()
                     self.refresh_map()
                 else:
                     self.custom_target_state = state
@@ -12846,6 +13280,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                         self.selected_provinces.clear()
                         for p in self.state_province_map[state]:
                             self.selected_provinces.add(p)
+                        self._refresh_selected_cache()
                         self.refresh_map()
         else:
             if owner and owner != "None":
@@ -12982,6 +13417,7 @@ class Vic3ProvincePainter(tk.Toplevel):
 
     def clear_selection(self):
         self.selected_provinces.clear()
+        self._refresh_selected_cache()
         self.refresh_map()
 
     def modify_state_action(self):
@@ -13165,6 +13601,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                             self.logic.state_manager.move_orphaned_region_state(old_state_id, tag, self.custom_target_state)
 
             self.selected_provinces.clear()
+            self._refresh_selected_cache()
             self.reload_data()
             messagebox.showinfo("Success", "Transferred provinces.")
 
@@ -13227,6 +13664,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces))
 
         self.selected_provinces.clear()
+        self._refresh_selected_cache()
         self.reload_data()
         messagebox.showinfo("Success", f"Created state {name}.")
 
