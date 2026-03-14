@@ -12624,6 +12624,52 @@ class Vic3ProvincePainter(tk.Toplevel):
         r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
         return (int(r * 255), int(g * 255), int(b * 255))
 
+    def _hex_to_packed_rgb(self, hex_code):
+        clean = str(hex_code).strip().lower()
+        if clean.startswith("x"):
+            clean = clean[1:]
+        if len(clean) != 6:
+            raise ValueError(f"Invalid province hex code: {hex_code}")
+        return int(clean, 16)
+
+    def _get_selected_fill_color(self, hex_code, fallback_rgb):
+        owner = self.province_owner_map.get(hex_code)
+        base_color = self.get_owner_display_color(owner) if owner else fallback_rgb
+        if base_color is None:
+            base_color = fallback_rgb
+
+        # Keep the owner tint visible while still making the selection pop.
+        return tuple((channel * 6 + 255 * 4) // 10 for channel in base_color)
+
+    def _expand_mask(self, mask, iterations=1):
+        expanded = mask.copy()
+        for _ in range(iterations):
+            grown = expanded.copy()
+            grown[:, 1:] |= expanded[:, :-1]
+            grown[:, :-1] |= expanded[:, 1:]
+            grown[1:, :] |= expanded[:-1, :]
+            grown[:-1, :] |= expanded[1:, :]
+            expanded = grown
+        return expanded
+
+    def _get_selected_outline_mask(self, selected_mask):
+        outline_mask = np.zeros_like(selected_mask, dtype=bool)
+        if not np.any(selected_mask):
+            return outline_mask
+
+        horizontal_diff = self.province_indices[:, 1:] != self.province_indices[:, :-1]
+        vertical_diff = self.province_indices[1:, :] != self.province_indices[:-1, :]
+
+        outline_mask[:, 1:] |= selected_mask[:, 1:] & horizontal_diff
+        outline_mask[:, :-1] |= selected_mask[:, :-1] & horizontal_diff
+        outline_mask[1:, :] |= selected_mask[1:, :] & vertical_diff
+        outline_mask[:-1, :] |= selected_mask[:-1, :] & vertical_diff
+
+        if self.scale_factor >= 1.0:
+            outline_mask = self._expand_mask(outline_mask, 1)
+
+        return outline_mask
+
     def refresh_map(self):
         if self.province_indices is None: return
 
@@ -12659,10 +12705,8 @@ class Vic3ProvincePainter(tk.Toplevel):
                 lookup_b[packed_rgb] = target_col[2]
 
         else: # PROVINCE MODE
-            # We want to show original province colors, but override selected ones
+            # Keep the province map visible, but make selected provinces readable.
 
-            # 1. Fill lookup with identity (color = index) for uniques
-            # We can iterate uniques to set the lookup table.
             for packed_rgb in uniques:
                 r = (packed_rgb >> 16) & 0xFF
                 g = (packed_rgb >> 8) & 0xFF
@@ -12671,23 +12715,47 @@ class Vic3ProvincePainter(tk.Toplevel):
                 lookup_g[packed_rgb] = g
                 lookup_b[packed_rgb] = b
 
-            # 2. Highlight selected
             for hex_code in self.selected_provinces:
-                # convert hex "xRRGGBB" to int
                 try:
-                    clean = hex_code.replace("x", "")
-                    val = int(clean, 16)
+                    val = self._hex_to_packed_rgb(hex_code)
                     if val < 16777216:
-                        lookup_r[val] = 255
-                        lookup_g[val] = 255
-                        lookup_b[val] = 255
-                except: pass
+                        fallback_color = (
+                            (val >> 16) & 0xFF,
+                            (val >> 8) & 0xFF,
+                            val & 0xFF,
+                        )
+                        highlight = self._get_selected_fill_color(hex_code, fallback_color)
+                        lookup_r[val] = highlight[0]
+                        lookup_g[val] = highlight[1]
+                        lookup_b[val] = highlight[2]
+                except ValueError:
+                    pass
 
         out_r = lookup_r[self.province_indices]
         out_g = lookup_g[self.province_indices]
         out_b = lookup_b[self.province_indices]
 
         final_img = np.dstack((out_r, out_g, out_b))
+
+        if self.selected_provinces:
+            selected_values = []
+            for hex_code in self.selected_provinces:
+                try:
+                    selected_values.append(self._hex_to_packed_rgb(hex_code))
+                except ValueError:
+                    continue
+
+            if selected_values:
+                selected_array = np.array(selected_values, dtype=self.province_indices.dtype)
+                selected_mask = np.isin(self.province_indices, selected_array)
+
+                if self.view_mode == "POLITICAL" and np.any(selected_mask):
+                    selected_pixels = final_img[selected_mask].astype(np.uint16)
+                    final_img[selected_mask] = ((selected_pixels * 7) + (255 * 3)) // 10
+
+                outline_mask = self._get_selected_outline_mask(selected_mask)
+                if np.any(outline_mask):
+                    final_img[outline_mask] = np.array([18, 18, 18], dtype=np.uint8)
 
         pil_img = Image.fromarray(final_img)
         self.display_image = ImageTk.PhotoImage(pil_img)
