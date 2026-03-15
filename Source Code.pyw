@@ -18,6 +18,150 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+
+def _resolve_popup_parent(explicit_parent=None):
+    candidates = []
+    if explicit_parent is not None:
+        candidates.append(explicit_parent)
+
+    root = getattr(tk, "_default_root", None)
+    if root is not None:
+        for getter in (root.grab_current, root.focus_get):
+            try:
+                candidate = getter()
+            except Exception:
+                candidate = None
+            if candidate is not None:
+                candidates.append(candidate)
+
+        try:
+            pointer_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        except Exception:
+            pointer_widget = None
+        if pointer_widget is not None:
+            candidates.append(pointer_widget)
+
+        candidates.append(root)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            window = candidate if isinstance(candidate, (tk.Tk, tk.Toplevel)) else candidate.winfo_toplevel()
+            if window is not None and window.winfo_exists():
+                return window
+        except Exception:
+            continue
+    return None
+
+
+def _restore_topmost(window, value):
+    try:
+        if window is not None and window.winfo_exists():
+            window.attributes("-topmost", value)
+    except Exception:
+        pass
+
+
+def _call_dialog_with_front_parent(func, *args, **kwargs):
+    parent = _resolve_popup_parent(kwargs.get("parent"))
+    if parent is not None:
+        kwargs["parent"] = parent
+
+    if parent is not None:
+        try:
+            parent.lift()
+            parent.focus_force()
+            parent.update_idletasks()
+        except Exception:
+            pass
+
+    return func(*args, **kwargs)
+
+
+def _patch_dialog_function(module, function_name):
+    original = getattr(module, function_name, None)
+    if not callable(original):
+        return
+
+    def wrapped(*args, _original=original, **kwargs):
+        return _call_dialog_with_front_parent(_original, *args, **kwargs)
+
+    setattr(module, function_name, wrapped)
+
+
+def _activate_popup_window(window, parent=None):
+    try:
+        if window is None or not window.winfo_exists():
+            return
+    except Exception:
+        return
+
+    try:
+        if parent is not None and parent.winfo_exists():
+            window.lift(parent)
+        else:
+            window.lift()
+    except Exception:
+        pass
+
+    try:
+        previous_topmost = bool(int(window.attributes("-topmost")))
+    except Exception:
+        previous_topmost = False
+
+    topmost_applied = False
+    try:
+        window.attributes("-topmost", True)
+        topmost_applied = True
+    except Exception:
+        pass
+
+    try:
+        window.focus_force()
+    except Exception:
+        pass
+
+    if topmost_applied:
+        try:
+            window.after(50, lambda w=window, value=previous_topmost: _restore_topmost(w, value))
+        except Exception:
+            pass
+
+
+_ORIGINAL_TOPLEVEL_INIT = tk.Toplevel.__init__
+
+
+def _patched_toplevel_init(self, master=None, cnf=None, **kw):
+    if cnf is None:
+        cnf = {}
+    _ORIGINAL_TOPLEVEL_INIT(self, master, cnf, **kw)
+    parent = _resolve_popup_parent(master)
+    try:
+        self.after_idle(lambda win=self, popup_parent=parent: _activate_popup_window(win, popup_parent))
+    except Exception:
+        pass
+
+
+tk.Toplevel.__init__ = _patched_toplevel_init
+
+for _dialog_func in [
+    "showinfo", "showwarning", "showerror", "askquestion", "askokcancel",
+    "askretrycancel", "askyesno", "askyesnocancel"
+]:
+    _patch_dialog_function(messagebox, _dialog_func)
+
+for _dialog_func in ["askstring", "askinteger", "askfloat"]:
+    _patch_dialog_function(simpledialog, _dialog_func)
+
+for _dialog_func in [
+    "askopenfilename", "askopenfilenames", "askopenfile", "askopenfiles",
+    "asksaveasfilename", "asksaveasfile", "askdirectory"
+]:
+    _patch_dialog_function(filedialog, _dialog_func)
+
+_patch_dialog_function(colorchooser, "askcolor")
+
 # =============================================================================
 #  CORE LOGIC
 # =============================================================================
@@ -7425,6 +7569,7 @@ class DemographicsMixer(ttk.Frame):
 class StateObject:
     def __init__(self, state_id):
         self.id = state_id
+        self.numeric_id = None
         self.provinces = set()
         self.hubs = {
             "city": None,
@@ -7508,6 +7653,11 @@ class StateManager:
                             nm = re.search(r"naval_exit_id\s*=\s*([0-9]+)", block)
                             if nm: sobj.naval_exit_id = nm.group(1)
 
+                            # Numeric Region ID
+                            id_match = re.search(r"(?m)^[ \t]*id\s*=\s*(\d+)", block)
+                            if id_match:
+                                sobj.numeric_id = int(id_match.group(1))
+
                             # Impassable
                             im = re.search(r"impassable\s*=\s*\{", block)
                             if im:
@@ -7523,6 +7673,37 @@ class StateManager:
                             cursor = e_idx
                         else:
                             cursor += 1
+
+    def _is_mod_state_file(self, file_path):
+        if not self.logic.mod_path or not file_path:
+            return False
+
+        mod_root = os.path.normcase(os.path.abspath(self.logic.mod_path))
+        candidate = os.path.normcase(os.path.abspath(file_path))
+        try:
+            return os.path.commonpath([candidate, mod_root]) == mod_root
+        except ValueError:
+            return False
+
+    def get_existing_state_numeric_ids(self, mod_only=False):
+        ids = []
+        for sobj in self.states.values():
+            if sobj.numeric_id is None:
+                continue
+            if mod_only and not self._is_mod_state_file(sobj.file_path):
+                continue
+            ids.append(sobj.numeric_id)
+        return ids
+
+    def get_next_state_numeric_id(self):
+        mod_ids = self.get_existing_state_numeric_ids(mod_only=True)
+        if mod_ids:
+            return max(mod_ids) + 1
+
+        all_ids = self.get_existing_state_numeric_ids(mod_only=False)
+        if all_ids:
+            return max(all_ids) + 1
+        return 1
 
     def transfer_state_assets(self, new_state_id, new_owner_tag=None, source_ratios=None):
         if not source_ratios: return 0
@@ -7911,7 +8092,7 @@ class StateManager:
                         with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(new_content)
                         self.logic.log(f"[CLEANUP] Removed {state_id} from history/{folder}/{file}")
 
-    def create_new_state(self, state_name_key, owner_data, province_list):
+    def create_new_state(self, state_name_key, owner_data, province_list, numeric_id=None, hub_assignments=None, naval_exit_id=None):
         state_id = self.logic.normalize_state_key(state_name_key)
 
         if state_id not in self.states:
@@ -7920,6 +8101,11 @@ class StateManager:
             sobj.file_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", "99_custom_regions.txt")
             self.states[state_id] = sobj
             self.logic.log(f"Created new StateObject: {state_id}")
+        else:
+            sobj = self.states[state_id]
+
+        if numeric_id is not None and sobj.numeric_id is None:
+            sobj.numeric_id = numeric_id
 
         # Determine Strategic Region from "Loser" of first province
         strategic_region = None
@@ -7978,6 +8164,20 @@ class StateManager:
             else:
                 source_ratios[os_id] = 0.0
             self.logic.log(f"[TRANSFER] Taking {count}/{total} ({source_ratios[os_id]:.2%}) from {os_id}")
+
+        if hub_assignments is not None:
+            for hub_type in ["city", "farm", "mine", "wood"]:
+                hub_hex = hub_assignments.get(hub_type)
+                if hub_hex:
+                    sobj.hubs[hub_type] = hub_hex.lower()
+
+            port_hex = hub_assignments.get("port")
+            if port_hex:
+                sobj.hubs["port"] = port_hex.lower()
+                sobj.naval_exit_id = str(naval_exit_id) if naval_exit_id is not None else None
+            else:
+                sobj.hubs["port"] = None
+                sobj.naval_exit_id = None
 
         self._update_localization(state_id, state_name_key)
 
@@ -8057,7 +8257,7 @@ class StateManager:
         # Add to new
         self.update_history_provinces(state_id, history_additions, [])
 
-    def _update_localization(self, state_id, name):
+    def _update_localization(self, state_id, name, hub_names=None, overwrite_existing=False):
         loc_dir = os.path.join(self.logic.mod_path, "localization", "english")
         os.makedirs(loc_dir, exist_ok=True)
         fpath = os.path.join(loc_dir, "map_l_english.yml")
@@ -8070,8 +8270,51 @@ class StateManager:
         except:
             with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
 
-        if state_id + ":" not in content:
-            with open(fpath, 'a', encoding='utf-8-sig') as f: f.write(f' {state_id}:0 "{name}"\n')
+        entries = []
+        content_changed = False
+        hub_placeholder_suffixes = {
+            "city": "City",
+            "farm": "Farms",
+            "wood": "Logging Camps",
+            "mine": "Mines",
+            "port": "Port"
+        }
+
+        entries.append((state_id, name, True))
+        sobj = self.states.get(state_id)
+        if sobj:
+            for hub_type, suffix in hub_placeholder_suffixes.items():
+                if not sobj.hubs.get(hub_type):
+                    continue
+                hub_key = f"HUB_NAME_{state_id}_{hub_type}"
+                hub_name = hub_names.get(hub_type) if hub_names and hub_type in hub_names else f"{name} {suffix}"
+                entries.append((hub_key, hub_name, False))
+
+        missing_entries = []
+        for key, loc_text, include_zero in entries:
+            safe_text = self.logic.safe_str(loc_text)
+            line = f' {key}{":0" if include_zero else ":"} "{safe_text}"'
+            pattern = re.compile(r"(?m)^[ \t]*" + re.escape(key) + r":(?:0)?[ \t]*\"(?:[^\"\\]|\\.)*\"[ \t]*$")
+
+            if pattern.search(content):
+                if overwrite_existing:
+                    updated_content = pattern.sub(line, content, count=1)
+                    if updated_content != content:
+                        content = updated_content
+                        content_changed = True
+            else:
+                missing_entries.append(line)
+
+        if missing_entries:
+            entry = "\n".join(missing_entries) + "\n"
+            if content and not content.endswith(("\n", "\r")):
+                entry = "\n" + entry
+            content += entry
+            content_changed = True
+
+        if content_changed:
+            with open(fpath, 'w', encoding='utf-8-sig') as f:
+                f.write(content)
 
     def _init_history(self, state_id, owner_tag):
         hist_dir = os.path.join(self.logic.mod_path, "common", "history", "states")
@@ -8435,20 +8678,17 @@ class StateManager:
 
         al_val = sobj.arable_land if sobj.arable_land is not None else 30
 
-        new_block = f"""{state_id} = {{
-    id = 1234
-    provinces = {{ {prov_str} }}
-    subsistence_building = "building_subsistence_farm"{hubs_str}{naval_str}{impass_block}
-    arable_land = {al_val}
-    arable_resources = {{ "bg_wheat_farms" "bg_livestock_ranches" }}
-    capped_resources = {{ "bg_lead_mining" 5 "bg_iron_mining" 5 "bg_logging" 10 }}
-}}
-"""
         if re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content):
             m = re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content)
             s, e = self.logic.find_block_content(content, m.end() - 1)
             if s:
                 block = content[s:e]
+
+                if sobj.numeric_id is not None:
+                    if re.search(r"(?m)^[ \t]*id\s*=", block):
+                        block = re.sub(r"(?m)^([ \t]*)id\s*=\s*\d+", rf"\1id = {sobj.numeric_id}", block, count=1)
+                    else:
+                        block = block[:1] + f"\n\tid = {sobj.numeric_id}" + block[1:]
 
                 if re.search(r"provinces\s*=\s*\{", block):
                     p_s, p_e = self.logic.find_block_content(block, re.search(r"provinces\s*=\s*\{", block).end() - 1)
@@ -8476,6 +8716,21 @@ class StateManager:
 
                 content = content[:s] + block + content[e:]
         else:
+            region_numeric_id = sobj.numeric_id
+            if region_numeric_id is None:
+                region_numeric_id = self.get_next_state_numeric_id()
+                sobj.numeric_id = region_numeric_id
+                self.logic.log(f"[WARN] No numeric ID loaded for {state_id}; defaulted to {region_numeric_id}.", 'warn')
+
+            new_block = f"""{state_id} = {{
+    id = {region_numeric_id}
+    provinces = {{ {prov_str} }}
+    subsistence_building = "building_subsistence_farm"{hubs_str}{naval_str}{impass_block}
+    arable_land = {al_val}
+    arable_resources = {{ "bg_wheat_farms" "bg_livestock_ranches" }}
+    capped_resources = {{ "bg_lead_mining" 5 "bg_iron_mining" 5 "bg_logging" 10 }}
+}}
+"""
             content += "\n" + new_block
 
         with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
@@ -8690,10 +8945,31 @@ class App(tk.Tk):
         self.style.configure("Treeview", background="white", foreground="black", fieldbackground="white")
         self.style.map("Treeview", background=[('selected', '#00ACC1')], foreground=[('selected', 'white')])
 
+    def get_app_base_dir(self):
+        try:
+            if getattr(sys, "frozen", False):
+                return os.path.dirname(os.path.abspath(sys.executable))
+            return os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            return os.getcwd()
+
+    def get_config_path(self):
+        return os.path.join(self.get_app_base_dir(), "config.json")
+
+    def get_config_search_paths(self):
+        paths = [self.get_config_path()]
+        legacy_path = os.path.abspath("config.json")
+        if legacy_path not in paths:
+            paths.append(legacy_path)
+        return paths
+
     def load_config(self):
         try:
-            if os.path.exists("config.json"):
-                with open("config.json", "r") as f:
+            for config_path in self.get_config_search_paths():
+                if not os.path.exists(config_path):
+                    continue
+
+                with open(config_path, "r") as f:
                     data = json.load(f)
                     path = data.get("mod_path", "")
                     if os.path.exists(path):
@@ -8706,11 +8982,12 @@ class App(tk.Tk):
                         self.vanilla_path_var.set(v_path)
                         self.logic.set_vanilla_path(v_path)
                         self.log_message(f"Loaded Vanilla Path: {v_path}")
+                break
         except: pass
 
     def save_config(self):
         try:
-            with open("config.json", "w") as f:
+            with open(self.get_config_path(), "w") as f:
                 json.dump({
                     "mod_path": self.path_var.get(),
                     "vanilla_path": self.vanilla_path_var.get()
@@ -12262,6 +12539,8 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.view_mode = "POLITICAL" # POLITICAL, PROVINCE, CUSTOM_STATE
         self.selected_provinces = set() # Set of hex strings
         self.custom_target_state = None # For Custom State Mode
+        self.pending_state_creation = None
+        self.pending_hub_step = None
 
         if self.start_mode == "CUSTOM_STATE":
             self.view_mode = "PROVINCE" # Start showing provinces
@@ -12380,6 +12659,188 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.map_width = max(int(round(self.source_width * self.scale_factor)), 1)
         self.map_height = max(int(round(self.source_height * self.scale_factor)), 1)
 
+    def _get_default_status_message(self):
+        if self.pending_state_creation and self.pending_hub_step:
+            labels = {
+                "city": "City",
+                "farm": "Farm",
+                "mine": "Mine",
+                "wood": "Wood",
+                "port": "Port"
+            }
+            label = labels.get(self.pending_hub_step, self.pending_hub_step.title())
+            return f"Hub selection: click a selected province for the {label} hub."
+        if self.start_mode == "CUSTOM_STATE":
+            return "Ready. Left Click to Select Provinces, Right Click to Set Target State."
+        return "Ready. Left Click to Paint, Right Click to Pick."
+
+    def _set_default_status(self, prefix=None):
+        message = self._get_default_status_message()
+        if prefix:
+            message = f"{prefix} {message}"
+        self.status_var.set(message)
+
+    def _cancel_pending_state_creation(self, show_message=False):
+        self.pending_state_creation = None
+        self.pending_hub_step = None
+        if show_message:
+            messagebox.showinfo("Cancelled", "State creation cancelled.")
+        self._set_default_status()
+
+    def _prompt_localization_value(self, prompt, default_value):
+        value = simpledialog.askstring(
+            "Create State",
+            prompt,
+            initialvalue=default_value
+        )
+        if value is None:
+            return default_value
+        value = value.strip()
+        return value if value else default_value
+
+    def _prompt_state_localization_names(self, state_id, fallback_state_name):
+        sobj = self.logic.state_manager.states.get(state_id)
+        if not sobj:
+            return
+
+        state_default = self.logic.get_loc_text(state_id)
+        if state_default == state_id:
+            state_default = fallback_state_name
+
+        state_loc_name = self._prompt_localization_value(
+            "Enter State localization name:",
+            state_default
+        )
+
+        hub_defaults = {
+            "city": "City",
+            "farm": "Farms",
+            "mine": "Mines",
+            "wood": "Logging Camps",
+            "port": "Port"
+        }
+        hub_names = {}
+        for hub_type, suffix in hub_defaults.items():
+            if not sobj.hubs.get(hub_type):
+                continue
+
+            hub_key = f"HUB_NAME_{state_id}_{hub_type}"
+            default_name = self.logic.get_loc_text(hub_key)
+            if default_name == hub_key:
+                default_name = f"{state_loc_name} {suffix}"
+
+            hub_names[hub_type] = self._prompt_localization_value(
+                f"Enter {hub_type.title()} hub localization name:",
+                default_name
+            )
+
+        self.logic.state_manager._update_localization(
+            state_id,
+            state_loc_name,
+            hub_names=hub_names,
+            overwrite_existing=True
+        )
+
+    def _begin_hub_selection(self, name, owner_data, numeric_id):
+        province_list = list(self.selected_provinces)
+        if isinstance(owner_data, dict):
+            stored_owner_data = {tag: list(provs) for tag, provs in owner_data.items()}
+        else:
+            stored_owner_data = owner_data
+
+        self.pending_state_creation = {
+            "name": name,
+            "owner_data": stored_owner_data,
+            "numeric_id": numeric_id,
+            "province_list": province_list,
+            "province_set": set(province_list),
+            "hub_assignments": {}
+        }
+        self.pending_hub_step = "city"
+        self.lift()
+        self.focus_force()
+        messagebox.showinfo(
+            "Hub Selection",
+            "Click a selected province for the City hub.\n\n"
+            "You will then pick Farm, Mine, and Wood hubs on the map. "
+            "Use Clear Selection if you want to cancel."
+        )
+        self._set_default_status()
+
+    def _finalize_pending_state_creation(self):
+        if not self.pending_state_creation:
+            return
+
+        data = self.pending_state_creation
+        hub_assignments = dict(data.get("hub_assignments", {}))
+        naval_exit_id = data.get("naval_exit_id")
+        name = data["name"]
+
+        self.logic.state_manager.create_new_state(
+            name,
+            data["owner_data"],
+            list(data["province_list"]),
+            data["numeric_id"],
+            hub_assignments=hub_assignments,
+            naval_exit_id=naval_exit_id
+        )
+        self._prompt_state_localization_names(self.logic.normalize_state_key(name), name)
+
+        self.pending_state_creation = None
+        self.pending_hub_step = None
+        self.selected_provinces.clear()
+        self._refresh_selected_cache()
+        self.reload_data()
+        messagebox.showinfo("Success", f"Created state {name}.")
+
+    def _handle_hub_selection_click(self, hex_code):
+        data = self.pending_state_creation
+        if not data or not self.pending_hub_step:
+            return
+
+        if hex_code not in data["province_set"]:
+            self._set_default_status(prefix=f"{hex_code} is not part of the new state.")
+            return
+
+        current_step = self.pending_hub_step
+        data["hub_assignments"][current_step] = hex_code
+
+        next_steps = {
+            "city": "farm",
+            "farm": "mine",
+            "mine": "wood"
+        }
+
+        if current_step in next_steps:
+            self.pending_hub_step = next_steps[current_step]
+            self._set_default_status(prefix=f"{current_step.title()} hub set to {hex_code}.")
+            return
+
+        if current_step == "wood":
+            self.pending_hub_step = None
+            has_port = messagebox.askyesno("Create State", "Does this state have a port?")
+            if has_port:
+                self.pending_hub_step = "port"
+                self._set_default_status(prefix=f"Wood hub set to {hex_code}.")
+            else:
+                data["hub_assignments"]["port"] = None
+                data["naval_exit_id"] = None
+                self._finalize_pending_state_creation()
+            return
+
+        if current_step == "port":
+            naval_exit_id = simpledialog.askinteger(
+                "Create State",
+                "Enter Naval Exit ID:",
+                minvalue=1
+            )
+            if naval_exit_id is None:
+                self._cancel_pending_state_creation(show_message=True)
+                return
+            data["naval_exit_id"] = str(naval_exit_id)
+            self.pending_hub_step = None
+            self._finalize_pending_state_creation()
+
     def _get_visible_viewport(self):
         if self.original_rgb_array is None:
             return None
@@ -12462,7 +12923,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
             self._restore_view_anchor(anchor)
             self.refresh_map()
-            self.status_var.set("Ready. Left Click to Paint, Right Click to Pick.")
+            self._set_default_status()
         except Exception as e:
             self.status_var.set(f"Error: {e}")
             traceback.print_exc()
@@ -12907,7 +13368,7 @@ class Vic3ProvincePainter(tk.Toplevel):
         if load_id != self._load_request_id:
             return
         self.refresh_map()
-        self.status_var.set("Ready. Left Click to Paint, Right Click to Pick.")
+        self._set_default_status()
 
     def parse_state_regions(self):
         # Load vanilla first, then modded state regions so mod files override.
@@ -13214,6 +13675,10 @@ class Vic3ProvincePainter(tk.Toplevel):
         if not hex_code:
             return
 
+        if self.pending_state_creation and self.pending_hub_step:
+            self._handle_hub_selection_click(hex_code)
+            return
+
         state = self.province_to_state.get(hex_code)
         owner = self.province_owner_map.get(hex_code, "None")
 
@@ -13250,6 +13715,10 @@ class Vic3ProvincePainter(tk.Toplevel):
                 self.status_var.set(f"Province: {hex_code} | State: {state} | Owner: {owner}")
 
     def on_right_click(self, event):
+        if self.pending_state_creation and self.pending_hub_step:
+            self._set_default_status()
+            return
+
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
         ix, iy = int(x), int(y)
@@ -13416,11 +13885,21 @@ class Vic3ProvincePainter(tk.Toplevel):
         txt.focus_set()
 
     def clear_selection(self):
+        if self.pending_state_creation:
+            if not messagebox.askyesno("Cancel State Creation", "Cancel the pending state creation and clear the current selection?"):
+                return
+            self.pending_state_creation = None
+            self.pending_hub_step = None
         self.selected_provinces.clear()
         self._refresh_selected_cache()
         self.refresh_map()
+        self._set_default_status()
 
     def modify_state_action(self):
+        if self.pending_state_creation:
+            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+
         if not self.custom_target_state:
             messagebox.showerror("Error", "No Target State selected (Right-Click a state).")
             return
@@ -13605,7 +14084,32 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.reload_data()
             messagebox.showinfo("Success", "Transferred provinces.")
 
+    def prompt_new_state_numeric_id(self):
+        default_id = self.logic.state_manager.get_next_state_numeric_id()
+        used_ids = set(self.logic.state_manager.get_existing_state_numeric_ids())
+
+        while True:
+            numeric_id = simpledialog.askinteger(
+                "Create State",
+                "Enter State ID:",
+                initialvalue=default_id,
+                minvalue=1
+            )
+            if numeric_id is None:
+                return None
+            if numeric_id in used_ids:
+                messagebox.showerror("Error", f"State ID {numeric_id} is already in use.")
+                default_id = numeric_id + 1
+                while default_id in used_ids:
+                    default_id += 1
+                continue
+            return numeric_id
+
     def create_new_state_action(self):
+        if self.pending_state_creation:
+            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+
         if not self.selected_provinces:
             messagebox.showerror("Error", "No provinces selected.")
             return
@@ -13631,6 +14135,8 @@ class Vic3ProvincePainter(tk.Toplevel):
         name = simpledialog.askstring("Create State", "Enter State Name (e.g. Texas):")
         if not name: return
 
+        owner_data = None
+
         if split_strategy == "single":
             if target_owner:
                 owner = target_owner
@@ -13639,7 +14145,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                 if not owner: return
 
             clean_owner = self.logic.format_tag_clean(owner)
-            self.logic.state_manager.create_new_state(name, clean_owner, list(self.selected_provinces))
+            owner_data = clean_owner
 
         else: # split
             # Build dict {tag: [provs]}
@@ -13661,7 +14167,16 @@ class Vic3ProvincePainter(tk.Toplevel):
                          first = list(found_owners)[0]
                          owner_data[first].append(p)
 
-            self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces))
+        numeric_id = self.prompt_new_state_numeric_id()
+        if numeric_id is None:
+            return
+
+        if messagebox.askyesno("Create State", "Would you like to specify hub provinces manually?"):
+            self._begin_hub_selection(name, owner_data, numeric_id)
+            return
+
+        self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces), numeric_id)
+        self._prompt_state_localization_names(self.logic.normalize_state_key(name), name)
 
         self.selected_provinces.clear()
         self._refresh_selected_cache()
