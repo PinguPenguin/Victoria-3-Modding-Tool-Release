@@ -7705,6 +7705,119 @@ class StateManager:
             return max(all_ids) + 1
         return 1
 
+    def _normalize_state_hubs(self, state_id):
+        sobj = self.states.get(state_id)
+        if not sobj:
+            return
+
+        impassable_set = {p.lower() for p in sobj.impassable if p}
+        valid_provinces = sorted(p for p in sobj.provinces if p not in impassable_set)
+
+        for htype, h_hex in list(sobj.hubs.items()):
+            current_hub = h_hex.lower() if h_hex else None
+            if not current_hub or current_hub not in impassable_set:
+                continue
+
+            if htype == "port":
+                sobj.hubs["port"] = None
+                sobj.naval_exit_id = None
+                self.logic.log(f"[MAP] Cleared port hub for {state_id} because {current_hub} is impassable.")
+                continue
+
+            used_hubs = {
+                value.lower()
+                for key, value in sobj.hubs.items()
+                if key != htype and value and value.lower() not in impassable_set
+            }
+            candidates = [p for p in valid_provinces if p not in used_hubs]
+
+            new_hub = candidates[0] if candidates else (valid_provinces[0] if valid_provinces else None)
+            sobj.hubs[htype] = new_hub
+            if new_hub:
+                self.logic.log(f"[MAP] Moved {htype} hub for {state_id} to {new_hub} because {current_hub} is impassable.")
+            else:
+                self.logic.log(f"[MAP] Cleared {htype} hub for {state_id}; no valid non-impassable province remains.", 'warn')
+
+    def toggle_province_impassable(self, province_hex):
+        clean_hex = province_hex.lower()
+        owner_state = self.province_owner_map.get(clean_hex)
+        if not owner_state or owner_state not in self.states:
+            return None
+
+        affected_states = set()
+
+        for state_id, sobj in self.states.items():
+            filtered = [p.lower() for p in sobj.impassable if p.lower() in sobj.provinces]
+            if state_id != owner_state and clean_hex in filtered:
+                sobj.impassable = [p for p in filtered if p != clean_hex]
+                self._normalize_state_hubs(state_id)
+                affected_states.add(state_id)
+            else:
+                sobj.impassable = filtered
+
+        owner_obj = self.states[owner_state]
+        current_impassable = {p.lower() for p in owner_obj.impassable if p.lower() in owner_obj.provinces}
+        if clean_hex in current_impassable:
+            current_impassable.remove(clean_hex)
+            is_impassable = False
+        else:
+            current_impassable.add(clean_hex)
+            is_impassable = True
+
+        owner_obj.impassable = sorted(current_impassable)
+        self._normalize_state_hubs(owner_state)
+        affected_states.add(owner_state)
+
+        for state_id in affected_states:
+            self.save_state_region(state_id)
+
+        return owner_state, is_impassable, affected_states
+
+    def mark_provinces_impassable(self, province_hexes):
+        owner_targets = {}
+
+        for province_hex in province_hexes:
+            clean_hex = province_hex.lower()
+            owner_state = self.province_owner_map.get(clean_hex)
+            if not owner_state or owner_state not in self.states:
+                continue
+            owner_targets.setdefault(owner_state, set()).add(clean_hex)
+
+        if not owner_targets:
+            return 0, 0, set()
+
+        target_hexes = set()
+        for hexes in owner_targets.values():
+            target_hexes.update(hexes)
+
+        affected_states = set()
+        already_marked = 0
+        total_targets = sum(len(hexes) for hexes in owner_targets.values())
+
+        for state_id, sobj in self.states.items():
+            valid_impassable = {p.lower() for p in sobj.impassable if p.lower() in sobj.provinces}
+            original_impassable = set(valid_impassable)
+            owned_targets = owner_targets.get(state_id, set())
+
+            already_marked += len(owned_targets & valid_impassable)
+
+            if owned_targets:
+                valid_impassable.update(owned_targets)
+
+            stale_targets = target_hexes - owned_targets
+            if stale_targets:
+                valid_impassable.difference_update(stale_targets)
+
+            sobj.impassable = sorted(valid_impassable)
+            if valid_impassable != original_impassable:
+                self._normalize_state_hubs(state_id)
+                affected_states.add(state_id)
+
+        for state_id in affected_states:
+            self.save_state_region(state_id)
+
+        return total_targets - already_marked, already_marked, affected_states
+
     def transfer_state_assets(self, new_state_id, new_owner_tag=None, source_ratios=None):
         if not source_ratios: return 0
 
@@ -8667,7 +8780,9 @@ class StateManager:
             return
 
         prov_str = " ".join(f'"{p.lower()}"' for p in sobj.provinces)
-        impass_str = " ".join(f'"{p.lower()}"' for p in sobj.impassable)
+        clean_impassable = sorted({p.lower() for p in sobj.impassable if p and p.lower() in sobj.provinces})
+        sobj.impassable = clean_impassable
+        impass_str = " ".join(clean_impassable)
 
         hubs_str = ""
         for k, v in sobj.hubs.items():
@@ -8677,6 +8792,15 @@ class StateManager:
         impass_block = f'\n\timpassable = {{ {impass_str} }}' if sobj.impassable else ""
 
         al_val = sobj.arable_land if sobj.arable_land is not None else 30
+
+        def append_block_line(block_text, line_text):
+            block_text = re.sub(r"\n?[ \t]*\}\s*$", "", block_text)
+            if not block_text.endswith("\n"):
+                block_text += "\n"
+            return block_text + f"\t{line_text}\n}}"
+
+        def cleanup_block_spacing(block_text):
+            return re.sub(r"\n(?:[ \t]*\n)+([ \t]*\})", r"\n\1", block_text)
 
         if re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content):
             m = re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content)
@@ -8700,19 +8824,42 @@ class StateManager:
                     if re.search(r"arable_land\s*=", block):
                         block = re.sub(r"arable_land\s*=\s*\d+", f"arable_land = {sobj.arable_land}", block)
                     else:
-                        # Append before closing brace
-                        block = block[:-1] + f"\n\tarable_land = {sobj.arable_land}\n}}"
+                        block = append_block_line(block, f"arable_land = {sobj.arable_land}")
 
                 for k, v in sobj.hubs.items():
                     if v:
                         if re.search(fr"{k}\s*=", block):
                             block = re.sub(fr'{k}\s*=\s*"?([xX0-9A-Fa-f]+)"?', f'{k} = "{v}"', block)
                         else:
-                            block = block[:-1] + f'\n\t{k} = "{v}"\n}}'
+                            block = append_block_line(block, f'{k} = "{v}"')
                     else:
                         # Hub removed/None, strip from file if present
                         if re.search(fr"{k}\s*=", block):
                             block = re.sub(fr'{k}\s*=\s*"?([xX0-9A-Fa-f]+)"?\s*\n?', '', block)
+
+                if sobj.naval_exit_id:
+                    if re.search(r"naval_exit_id\s*=", block):
+                        block = re.sub(r"naval_exit_id\s*=\s*\d+", f"naval_exit_id = {sobj.naval_exit_id}", block, count=1)
+                    else:
+                        block = append_block_line(block, f"naval_exit_id = {sobj.naval_exit_id}")
+                else:
+                    block = re.sub(r"(?m)^[ \t]*naval_exit_id\s*=\s*\d+[ \t]*\n?", "", block, count=1)
+
+                if sobj.impassable:
+                    if re.search(r"impassable\s*=\s*\{", block):
+                        block = re.sub(
+                            r"impassable\s*=\s*\{[^{}]*\}",
+                            f"impassable = {{ {impass_str} }}",
+                            block,
+                            count=1,
+                            flags=re.S
+                        )
+                    else:
+                        block = append_block_line(block, f"impassable = {{ {impass_str} }}")
+                else:
+                    block = re.sub(r"(?ms)^[ \t]*impassable\s*=\s*\{[^{}]*\}[ \t]*\n?", "", block, count=1)
+
+                block = cleanup_block_spacing(block)
 
                 content = content[:s] + block + content[e:]
         else:
@@ -12522,6 +12669,8 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.base_render_scale = None
         self.selected_packed_values = np.array([], dtype=np.int32)
         self.selected_fill_colors = {}
+        self.impassable_provinces = set()
+        self.impassable_packed_values = np.array([], dtype=np.int32)
         self.map_width = 0
         self.map_height = 0
         self.source_width = 0
@@ -12532,6 +12681,10 @@ class Vic3ProvincePainter(tk.Toplevel):
         self._zoom_anchor = None
         self._is_panning = False
         self._viewport_after_id = None
+        self._left_drag_start = None
+        self._left_drag_active = False
+        self._left_drag_box_id = None
+        self._left_drag_threshold = 6
 
         self.pending_transfers = [] # List of (state, old_tag, new_tag)
 
@@ -12541,6 +12694,7 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.custom_target_state = None # For Custom State Mode
         self.pending_state_creation = None
         self.pending_hub_step = None
+        self.impassable_mode = False
 
         if self.start_mode == "CUSTOM_STATE":
             self.view_mode = "PROVINCE" # Start showing provinces
@@ -12595,6 +12749,126 @@ class Vic3ProvincePainter(tk.Toplevel):
             else np.array([], dtype=np.int32)
         )
         self.selected_fill_colors = fill_colors
+
+    def _refresh_impassable_cache(self):
+        impassable = set()
+        for state_id, sobj in self.logic.state_manager.states.items():
+            province_set = {p.lower() for p in sobj.provinces}
+            for province_hex in sobj.impassable:
+                clean_hex = province_hex.lower()
+                if clean_hex in province_set and self.logic.state_manager.province_owner_map.get(clean_hex) == state_id:
+                    impassable.add(clean_hex)
+
+        self.impassable_provinces = impassable
+        packed_values = []
+        for hex_code in impassable:
+            try:
+                packed_values.append(self._hex_to_packed_rgb(hex_code))
+            except ValueError:
+                continue
+
+        self.impassable_packed_values = (
+            np.array(packed_values, dtype=np.int32)
+            if packed_values
+            else np.array([], dtype=np.int32)
+        )
+
+    def _supports_drag_box(self):
+        if self.pending_state_creation and self.pending_hub_step:
+            return False
+        return self.impassable_mode or self.view_mode == "PROVINCE" or self.start_mode == "CUSTOM_STATE"
+
+    def _clear_drag_box(self):
+        if self._left_drag_box_id is not None:
+            self.canvas.delete(self._left_drag_box_id)
+            self._left_drag_box_id = None
+
+    def _get_canvas_event_point(self, event):
+        return self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+    def _get_hexes_in_canvas_box(self, x0, y0, x1, y1):
+        if self.original_rgb_array is None:
+            return set()
+
+        left = max(int(min(x0, x1)), 0)
+        top = max(int(min(y0, y1)), 0)
+        right = min(int(max(x0, x1)), self.map_width - 1)
+        bottom = min(int(max(y0, y1)), self.map_height - 1)
+
+        if right < left or bottom < top:
+            return set()
+
+        scale = max(self.scale_factor, 0.0001)
+        src_left = min(int(left / scale), self.source_width - 1)
+        src_top = min(int(top / scale), self.source_height - 1)
+        src_right = min(int(right / scale), self.source_width - 1)
+        src_bottom = min(int(bottom / scale), self.source_height - 1)
+
+        rgb_slice = self.original_rgb_array[src_top:src_bottom + 1, src_left:src_right + 1]
+        if rgb_slice.size == 0:
+            return set()
+
+        packed_slice = (
+            rgb_slice[:, :, 0].astype(np.int32) << 16
+        ) + (
+            rgb_slice[:, :, 1].astype(np.int32) << 8
+        ) + rgb_slice[:, :, 2].astype(np.int32)
+
+        province_hexes = set()
+        for packed in np.unique(packed_slice.reshape(-1)).tolist():
+            hex_code = self._packed_to_hex(packed)
+            if self.impassable_mode:
+                owner_state = self.logic.state_manager.province_owner_map.get(hex_code)
+                if owner_state and owner_state in self.logic.state_manager.states:
+                    province_hexes.add(hex_code)
+            else:
+                if hex_code in self.province_to_state:
+                    province_hexes.add(hex_code)
+
+        return province_hexes
+
+    def _apply_box_selection(self, province_hexes):
+        if not province_hexes:
+            self._set_default_status(prefix="Selection box did not cover any state provinces.")
+            return
+
+        new_provinces = province_hexes - self.selected_provinces
+        if not new_provinces:
+            self._set_default_status(prefix=f"Selection box covered {len(province_hexes)} provinces; all were already selected.")
+            return
+
+        self.selected_provinces.update(new_provinces)
+        self._refresh_selected_cache()
+        self.refresh_map()
+        self.status_var.set(f"Selected {len(new_provinces)} provinces from box. Total selected: {len(self.selected_provinces)}.")
+
+    def _apply_impassable_box(self, province_hexes):
+        if not province_hexes:
+            self._set_default_status(prefix="Selection box did not cover any owned state provinces.")
+            return
+
+        marked_count, already_marked, affected_states = self.logic.state_manager.mark_provinces_impassable(province_hexes)
+        total_box = len(province_hexes)
+
+        if affected_states:
+            self._refresh_impassable_cache()
+            self.refresh_map()
+            state_count = len(affected_states)
+            if marked_count > 0:
+                already_suffix = f" ({already_marked} already impassable)." if already_marked else "."
+                self.status_var.set(
+                    f"Marked {marked_count} provinces impassable from box across {state_count} state{'s' if state_count != 1 else ''}{already_suffix}"
+                )
+            elif already_marked > 0:
+                self.status_var.set(f"All {already_marked} provinces in box were already impassable.")
+            else:
+                self.status_var.set(f"Updated impassable entries across {state_count} state{'s' if state_count != 1 else ''}.")
+            return
+
+        if already_marked == total_box:
+            self.status_var.set(f"All {already_marked} provinces in box were already impassable.")
+        else:
+            self._set_default_status(prefix="No impassable changes were needed for the selection box.")
 
     def _capture_view_anchor(self, event=None):
         canvas_width = max(1, self.canvas.winfo_width())
@@ -12670,8 +12944,12 @@ class Vic3ProvincePainter(tk.Toplevel):
             }
             label = labels.get(self.pending_hub_step, self.pending_hub_step.title())
             return f"Hub selection: click a selected province for the {label} hub."
+        if self.impassable_mode:
+            return "Impassable mode: left click to toggle one province, or drag a box to mark many impassable."
         if self.start_mode == "CUSTOM_STATE":
-            return "Ready. Left Click to Select Provinces, Right Click to Set Target State."
+            return "Ready. Left click or drag a box to select provinces, right click to set target state."
+        if self.view_mode == "PROVINCE":
+            return "Province selector: left click or drag a box to select provinces."
         return "Ready. Left Click to Paint, Right Click to Pick."
 
     def _set_default_status(self, prefix=None):
@@ -13217,6 +13495,8 @@ class Vic3ProvincePainter(tk.Toplevel):
 
             tk.Button(toolbar, text="Transfer Selected to Target", command=self.modify_state_action, bg="#FFA726", fg="black").pack(side=tk.LEFT, padx=10)
             tk.Button(toolbar, text="Create New State", command=self.create_new_state_action, bg="#66BB6A", fg="black").pack(side=tk.LEFT, padx=5)
+            self.btn_impassable_mode = tk.Button(toolbar, text="Make Impassable", command=self.toggle_impassable_mode, bg="#8E24AA", fg="white")
+            self.btn_impassable_mode.pack(side=tk.LEFT, padx=5)
             tk.Button(toolbar, text="Clear Selection", command=self.clear_selection, bg="#424242", fg="white").pack(side=tk.LEFT, padx=5)
 
         else:
@@ -13266,7 +13546,9 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas.bind("<Configure>", self.on_canvas_configure)
 
-        self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<ButtonPress-1>", self.on_left_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_left_button_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_button_release)
         self.canvas.bind("<Button-3>", self.on_right_click)
 
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
@@ -13275,6 +13557,61 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas.bind("<ButtonPress-2>", self.start_pan)
         self.canvas.bind("<B2-Motion>", self.do_pan)
         self.canvas.bind("<ButtonRelease-2>", self.end_pan)
+
+    def on_left_button_press(self, event):
+        self._left_drag_start = self._get_canvas_event_point(event)
+        self._left_drag_active = False
+        self._clear_drag_box()
+        return "break"
+
+    def on_left_button_drag(self, event):
+        if self._left_drag_start is None or not self._supports_drag_box():
+            return "break"
+
+        curr_x, curr_y = self._get_canvas_event_point(event)
+        start_x, start_y = self._left_drag_start
+
+        if not self._left_drag_active:
+            moved_x = abs(curr_x - start_x)
+            moved_y = abs(curr_y - start_y)
+            if moved_x < self._left_drag_threshold and moved_y < self._left_drag_threshold:
+                return "break"
+            self._left_drag_active = True
+            self._left_drag_box_id = self.canvas.create_rectangle(
+                start_x,
+                start_y,
+                curr_x,
+                curr_y,
+                outline="#FFEE58" if self.impassable_mode else "#4FC3F7",
+                width=2,
+                dash=(6, 3)
+            )
+        else:
+            self.canvas.coords(self._left_drag_box_id, start_x, start_y, curr_x, curr_y)
+
+        return "break"
+
+    def on_left_button_release(self, event):
+        if self._left_drag_start is None:
+            return "break"
+
+        start_x, start_y = self._left_drag_start
+        end_x, end_y = self._get_canvas_event_point(event)
+        was_drag = self._left_drag_active
+
+        self._left_drag_start = None
+        self._left_drag_active = False
+        self._clear_drag_box()
+
+        if was_drag and self._supports_drag_box():
+            province_hexes = self._get_hexes_in_canvas_box(start_x, start_y, end_x, end_y)
+            if self.impassable_mode:
+                self._apply_impassable_box(province_hexes)
+            else:
+                self._apply_box_selection(province_hexes)
+            return "break"
+
+        return self.on_click(event)
 
     def start_pan(self, event):
         self._is_panning = True
@@ -13347,6 +13684,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             # 3. History (State+Hex -> Owner)
             self.parse_history_states()
             self._refresh_selected_cache()
+            self._refresh_impassable_cache()
 
             # 4. Map Image (Only if needed)
             if reload_image or self.original_rgb_array is None:
@@ -13601,8 +13939,11 @@ class Vic3ProvincePainter(tk.Toplevel):
         render_width = viewport.get("render_width", 0)
         render_height = viewport.get("render_height", 0)
         visible_region = final_img[:render_height, :render_width]
-        selected_values = self.selected_packed_values
+        selected_values = self.selected_packed_values if not self.impassable_mode else np.array([], dtype=np.int32)
+        impassable_values = self.impassable_packed_values if self.impassable_mode else np.array([], dtype=np.int32)
         outline_color = np.array([18, 18, 18], dtype=np.uint8)
+        impassable_color = np.array([160, 48, 48], dtype=np.uint8)
+        impassable_outline_color = np.array([64, 12, 12], dtype=np.uint8)
 
         if view_packed is not None and render_width > 0 and render_height > 0:
             unique_values = None
@@ -13619,6 +13960,21 @@ class Vic3ProvincePainter(tk.Toplevel):
                         palette[idx] = self.get_owner_display_color(owner) or (50, 50, 50)
 
                 visible_region[:, :] = palette[inverse_map]
+
+            if impassable_values.size > 0:
+                if unique_values is None or inverse_map is None:
+                    unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
+                    inverse_map = inverse.reshape(render_height, render_width)
+
+                impassable_unique_mask = np.isin(unique_values, impassable_values)
+                if np.any(impassable_unique_mask):
+                    impassable_mask = impassable_unique_mask[inverse_map]
+                    impassable_pixels = visible_region[impassable_mask].astype(np.uint16)
+                    visible_region[impassable_mask] = ((impassable_pixels * 6) + (impassable_color * 4)) // 10
+
+                    impassable_outline_mask = self._get_selected_outline_mask(impassable_mask, view_packed)
+                    if np.any(impassable_outline_mask):
+                        visible_region[impassable_outline_mask] = impassable_outline_color
 
             if selected_values.size > 0:
                 if unique_values is None or inverse_map is None:
@@ -13679,6 +14035,23 @@ class Vic3ProvincePainter(tk.Toplevel):
             self._handle_hub_selection_click(hex_code)
             return
 
+        if self.impassable_mode:
+            result = self.logic.state_manager.toggle_province_impassable(hex_code)
+            if not result:
+                self.status_var.set(f"Could not resolve an owning state for {hex_code}.")
+                return
+
+            owner_state, is_impassable, affected_states = result
+            self._refresh_impassable_cache()
+            self.refresh_map()
+            if is_impassable:
+                self.status_var.set(f"Marked {hex_code} impassable in {owner_state}.")
+            else:
+                self.status_var.set(f"Removed {hex_code} from impassable in {owner_state}.")
+            if len(affected_states) > 1:
+                self.logic.log(f"[MAP] Cleaned stale impassable references for {hex_code} in {len(affected_states)} state files.")
+            return
+
         state = self.province_to_state.get(hex_code)
         owner = self.province_owner_map.get(hex_code, "None")
 
@@ -13716,6 +14089,9 @@ class Vic3ProvincePainter(tk.Toplevel):
 
     def on_right_click(self, event):
         if self.pending_state_creation and self.pending_hub_step:
+            self._set_default_status()
+            return
+        if self.impassable_mode:
             self._set_default_status()
             return
 
@@ -13864,6 +14240,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.btn_prov_mode.config(text="Province Selector", bg="#424242")
             self.btn_export.pack_forget()
         self.refresh_map()
+        self._set_default_status()
 
     def export_selected_provinces(self):
         if not self.selected_provinces:
@@ -13898,6 +14275,9 @@ class Vic3ProvincePainter(tk.Toplevel):
     def modify_state_action(self):
         if self.pending_state_creation:
             messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+        if self.impassable_mode:
+            messagebox.showerror("Error", "Exit impassable mode before transferring provinces.")
             return
 
         if not self.custom_target_state:
@@ -14084,6 +14464,20 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.reload_data()
             messagebox.showinfo("Success", "Transferred provinces.")
 
+    def toggle_impassable_mode(self):
+        if self.pending_state_creation:
+            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+
+        self.impassable_mode = not self.impassable_mode
+        if self.start_mode == "CUSTOM_STATE":
+            if self.impassable_mode:
+                self.btn_impassable_mode.config(text="Exit Impassable Mode", bg="#C62828")
+            else:
+                self.btn_impassable_mode.config(text="Make Impassable", bg="#8E24AA")
+        self._set_default_status()
+        self.refresh_map()
+
     def prompt_new_state_numeric_id(self):
         default_id = self.logic.state_manager.get_next_state_numeric_id()
         used_ids = set(self.logic.state_manager.get_existing_state_numeric_ids())
@@ -14108,6 +14502,9 @@ class Vic3ProvincePainter(tk.Toplevel):
     def create_new_state_action(self):
         if self.pending_state_creation:
             messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+        if self.impassable_mode:
+            messagebox.showerror("Error", "Exit impassable mode before creating a new state.")
             return
 
         if not self.selected_provinces:
