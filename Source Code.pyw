@@ -2266,9 +2266,8 @@ class Vic3Logic:
             "discoverable": [] # List of dicts {type, amount}
         }
 
-        # Normalize state name
-        if not state_name.startswith("STATE_"):
-            state_name = f"STATE_{state_name.upper()}"
+        # Normalize state name consistently with the rest of the tool.
+        state_name = self.normalize_state_key(state_name)
 
         found_content = None
         for p in paths:
@@ -2363,8 +2362,7 @@ class Vic3Logic:
                  mod_states_dir = os.path.join(self.mod_path, "map_data", "state_regions")
                  os.makedirs(mod_states_dir, exist_ok=True)
 
-        if not state_name.startswith("STATE_"):
-            state_name = f"STATE_{state_name.upper()}"
+        state_name = self.normalize_state_key(state_name)
 
         # Check existing mod file
         for root, _, files in os.walk(mod_states_dir):
